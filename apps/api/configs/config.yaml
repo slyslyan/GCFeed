@@ -1,0 +1,32 @@
+port: 8080
+jwt:
+  secret: "replace-with-strong-secret"
+  access_ttl: "15m"
+
+internal:
+  token: "replace-with-internal-token"
+
+database:
+  host: "localhost"
+  port: 3306
+  user: "root"
+  password: "sealos123"
+  name: "GCFeed"
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
+rabbitmq:
+  url: "amqp://guest:guest@localhost:5672/"
+  interaction_exchange: "gcfeed.interaction"
+  action_changed_queue: "gcfeed.interaction.action_changed"
+  action_changed_routing: "interaction.action_changed"
+  video_exchange: "gcfeed.video"
+  video_published_queue: "gcfeed.video.published"
+  video_embedding_queue: "gcfeed.video.embedding"
+  video_published_routing: "video.published"
+  exposure_exchange: "gcfeed.exposure"
+  view_event_recorded_queue: "gcfeed.exposure.view_event_recorded"
+  view_event_recorded_routing: "exposure.view_event_recorded"

@@ -1,0 +1,4 @@
+.DS_Store
+apps/api/uploads/*
+CLAUDE.md
+.claude/
