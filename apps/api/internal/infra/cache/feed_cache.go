@@ -6,10 +6,10 @@ import (
 	domainfeed "GCFeed/internal/domain/feed"
 	domaininteraction "GCFeed/internal/domain/interaction"
 	inframetrics "GCFeed/internal/infra/metrics"
+	"container/heap"
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -325,35 +325,16 @@ func (c *FeedCache) ListFollowingIndexPage(ctx context.Context, viewerID int64, 
 		return nil, false, nil
 	}
 
-	seen := map[int64]struct{}{}
-	items := make([]*domainfeed.FeedPageItem, 0, limit*len(rangeCommands))
-	for commandIndex, cmd := range rangeCommands {
+	// 每源已按 score 降序返回,交给 K 路归并合并取前 limit 条。
+	streams := make([][]string, len(rangeCommands))
+	for i, cmd := range rangeCommands {
 		members, err := cmd.Result()
 		if err != nil && err != redis.Nil {
 			return nil, false, err
 		}
-		for _, member := range members {
-			item, ok := feedPageItemFromFollowingMember(member)
-			if !ok {
-				continue
-			}
-			if commandIndex > 0 && item.AuthorID > 0 {
-				allowedAuthors := int64Set(authorIDs)
-				if _, followed := allowedAuthors[item.AuthorID]; !followed {
-					continue
-				}
-			}
-			if _, exists := seen[item.VideoID]; exists {
-				continue
-			}
-			seen[item.VideoID] = struct{}{}
-			items = append(items, item)
-		}
+		streams[i] = members
 	}
-	sortFeedPageItemsByTimeline(items)
-	if len(items) > limit {
-		items = items[:limit]
-	}
+	items := mergeFollowingIndexes(streams, authorIDs, limit)
 	return items, true, nil
 }
 
@@ -759,13 +740,85 @@ func int64Set(values []int64) map[int64]struct{} {
 	return set
 }
 
-func sortFeedPageItemsByTimeline(items []*domainfeed.FeedPageItem) {
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].PublishedAt.Equal(items[j].PublishedAt) {
-			return items[i].VideoID > items[j].VideoID
+// followingMergeEntry 是 K 路归并的堆元素:一个数据源当前暴露的头部条目。
+type followingMergeEntry struct {
+	score  float64
+	srcIdx int
+	item   *domainfeed.FeedPageItem
+}
+
+// followingMergeHeap 是最大堆:score 大的优先弹出;同 score 时 inbox(下标 0)优先。
+type followingMergeHeap []*followingMergeEntry
+
+func (h followingMergeHeap) Len() int { return len(h) }
+func (h followingMergeHeap) Less(i, j int) bool {
+	if h[i].score != h[j].score {
+		return h[i].score > h[j].score
+	}
+	return h[i].srcIdx < h[j].srcIdx
+}
+func (h followingMergeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *followingMergeHeap) Push(x any)   { *h = append(*h, x.(*followingMergeEntry)) }
+func (h *followingMergeHeap) Pop() any {
+	old := *h
+	n := len(old)
+	entry := old[n-1]
+	*h = old[:n-1]
+	return entry
+}
+
+// mergeFollowingIndexes 对多个已按 score 降序排列的成员流做 K 路归并,
+// 返回按 score 降序的前 limit 条:同一视频(VideoID)只保留第一条(源下标小的优先),
+// outbox(下标 > 0)条目校验作者仍在关注列表,取满 limit 即提前终止。
+func mergeFollowingIndexes(streams [][]string, authorIDs []int64, limit int) []*domainfeed.FeedPageItem {
+	if limit <= 0 {
+		return nil
+	}
+	allowed := int64Set(authorIDs)
+	pos := make([]int, len(streams))
+	h := &followingMergeHeap{}
+	heap.Init(h)
+
+	// next 从 srcIdx 源取下一条有效条目入堆:跳过解析失败、作者不在关注列表(outbox)的。
+	next := func(srcIdx int) {
+		members := streams[srcIdx]
+		for pos[srcIdx] < len(members) {
+			member := members[pos[srcIdx]]
+			pos[srcIdx]++
+			item, ok := feedPageItemFromFollowingMember(member)
+			if !ok {
+				continue
+			}
+			if srcIdx > 0 && item.AuthorID > 0 {
+				if _, followed := allowed[item.AuthorID]; !followed {
+					continue
+				}
+			}
+			heap.Push(h, &followingMergeEntry{
+				score:  followingIndexScore(item.PublishedAt, item.VideoID),
+				srcIdx: srcIdx,
+				item:   item,
+			})
+			return
 		}
-		return items[i].PublishedAt.After(items[j].PublishedAt)
-	})
+	}
+
+	for i := range streams {
+		next(i)
+	}
+
+	seen := map[int64]struct{}{}
+	items := make([]*domainfeed.FeedPageItem, 0, limit)
+	for len(items) < limit && h.Len() > 0 {
+		entry := heap.Pop(h).(*followingMergeEntry)
+		next(entry.srcIdx)
+		if _, exists := seen[entry.item.VideoID]; exists {
+			continue
+		}
+		seen[entry.item.VideoID] = struct{}{}
+		items = append(items, entry.item)
+	}
+	return items
 }
 
 func interactionActionKey(userID int64, videoID int64, actionType string) string {
