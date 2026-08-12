@@ -8,6 +8,7 @@ type Config struct {
 	Database DatabaseConfig `yaml:"database"`
 	Redis    RedisConfig    `yaml:"redis"`
 	RabbitMQ RabbitMQConfig `yaml:"rabbitmq"`
+	Milvus   MilvusConfig   `yaml:"milvus"`
 }
 
 // JWTConfig 保存 JWT 签名密钥和访问 token 有效期。
@@ -35,6 +36,11 @@ type RedisConfig struct {
 	Addr     string `yaml:"addr"`
 	Password string `yaml:"password"`
 	DB       int    `yaml:"db"`
+}
+
+// MilvusConfig 保存 Milvus 向量库连接参数，为空时向量召回路自动降级。
+type MilvusConfig struct {
+	Address string `yaml:"address"`
 }
 
 // RabbitMQConfig 保存 RabbitMQ 连接和队列配置。

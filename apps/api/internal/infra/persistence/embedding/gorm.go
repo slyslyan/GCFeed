@@ -63,3 +63,33 @@ func (r *Repository) FindVideoEmbedding(ctx context.Context, videoID int64, mode
 		item.UpdatedAt,
 	), nil
 }
+
+// ListAllVideoEmbeddings 按 video_id 递增分页遍历全部向量记录。
+func (r *Repository) ListAllVideoEmbeddings(ctx context.Context, afterID int64, limit int) ([]*domainembedding.VideoEmbedding, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 500
+	}
+	var items []VideoEmbeddingModel
+	err := r.db.WithContext(ctx).
+		Where("video_id > ?", afterID).
+		Order("video_id ASC").
+		Limit(limit).
+		Find(&items).
+		Error
+	if err != nil {
+		return nil, err
+	}
+	embeddings := make([]*domainembedding.VideoEmbedding, 0, len(items))
+	for _, item := range items {
+		embeddings = append(embeddings, domainembedding.RestoreVideoEmbedding(
+			item.VideoID,
+			item.Model,
+			item.Dimension,
+			item.EmbeddingJSON,
+			item.TextHash,
+			item.CreatedAt,
+			item.UpdatedAt,
+		))
+	}
+	return embeddings, nil
+}

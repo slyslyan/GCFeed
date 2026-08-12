@@ -37,6 +37,7 @@ type Candidate struct {
 	FreshnessScore float64
 	Reason         string
 	PublishedAt    time.Time
+	Source         string
 }
 
 type ExposureWrite struct {
@@ -161,8 +162,8 @@ func NewExposureWrite(userID int64, videoID int64, scene string, requestID strin
 	}, nil
 }
 
-func RestoreCandidate(videoID int64, authorID int64, rankScore float64, similarity float64, hotScore int, freshnessScore float64, reason string, publishedAt time.Time) *Candidate {
-	return &Candidate{
+func RestoreCandidate(videoID int64, authorID int64, rankScore float64, similarity float64, hotScore int, freshnessScore float64, reason string, publishedAt time.Time, sources ...string) *Candidate {
+	candidate := &Candidate{
 		VideoID:        videoID,
 		AuthorID:       authorID,
 		RankScore:      rankScore,
@@ -172,6 +173,10 @@ func RestoreCandidate(videoID int64, authorID int64, rankScore float64, similari
 		Reason:         strings.TrimSpace(reason),
 		PublishedAt:    publishedAt,
 	}
+	if len(sources) > 0 {
+		candidate.Source = sources[0]
+	}
+	return candidate
 }
 
 func RestoreExposure(id int64, userID int64, videoID int64, firstExposedAt time.Time, lastExposedAt time.Time, exposureCount int, lastScene string) *Exposure {

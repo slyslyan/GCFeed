@@ -62,3 +62,30 @@
 ## 6. 前端接入点
 
 推荐模块主要服务后端 Feed。前端通过 Feed 接口间接使用推荐结果。
+
+## 7. 多路召回（当前实现）
+
+推荐链路采用三路召回 + 合并器的分层结构：
+
+| 召回路 | 来源 | 解决什么问题 |
+| --- | --- | --- |
+| 热度召回 | `video` + `video_stat`，hot_score 倒序 | 普适兜底，冷启动用户保障 |
+| 关注召回 | `user_follow` JOIN `video`，关注作者 72h 内新视频 | 新视频冷启动（关系链社交信号） |
+| 向量召回 | Milvus 2.4 `video_embedding` collection（128 维 hash-ngram + HNSW/COSINE 索引） | 个性化（用户兴趣向量 ANN topK） |
+
+- 召回层抽象：`Recaller` 接口 + `Merger` 合并器（去重、热度补齐、关注路配额保底、曝光剔除）。
+- 三路并发执行，单路超时（500ms）或失败只丢弃该路结果，不影响其他路；无召回器注册时回退单路热度池。
+- 向量路选型：MySQL 8.4 Community 实测不支持 VECTOR 类型（1064 语法错误、无 STRING_TO_VECTOR），改选 Milvus standalone（etcd + minio + milvus docker compose 部署，`infra/vector/milvus.go` 封装 `VectorStore` 接口）。
+- 向量写入：embedding worker 生成向量后 MySQL 落库 + Milvus 双写（失败只记日志不阻塞消息流），worker 启动时对存量向量按主键 upsert 幂等回填；Milvus 未就绪不阻塞服务启动（`LazyStore` 后台重试连接 + 建集合），向量路就绪前自动降级。
+- 向量路 ANN 查询不带业务过滤，状态/时间过滤在应用层完成（`enrichVideos` 批量校验 status + 30 天窗口）。
+- Milvus COSINE 距离即 1 - 余弦相似度，召回距离直接换算为粗排 similarity 特征；关注路候选有新鲜度加成，避免低热度新视频被公式压底。
+- 关注路双保险：72h 时间窗口 + 条数硬上限（200），防止大 V 刷屏撑爆候选池。
+
+## 8. 未来规划：内容审核与黑名单
+
+当前项目没有审核功能，因此没有黑名单机制（仅热度/关注/向量三路按状态过滤）。后续如果加入内容审核，建议路径：
+
+1. 新增审核能力（人工/机审判定视频违规），违规结果落库（`video.status` 或独立审核表）。
+2. 违规事件触发写 Redis 黑名单集合（如 `ban:video:{id}`，带 TTL）。
+3. 多路召回统一接入：热度/关注路 SQL 增加黑名单过滤，向量路 `enrichVideos` 应用层批量校验（`SMISMEMBER`）。
+4. 兜底：黑名单 Redis 不可用时跳过校验（与向量路降级同策略），优先保证可用性。

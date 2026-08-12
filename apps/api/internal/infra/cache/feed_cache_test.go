@@ -1,9 +1,12 @@
 package infracache
 
 import (
+	domainfeed "GCFeed/internal/domain/feed"
 	domaininteraction "GCFeed/internal/domain/interaction"
 	"context"
 	"encoding/json"
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -180,4 +183,76 @@ func TestActionStatBaseInitUsesInitialStat(t *testing.T) {
 	if stat != initial {
 		t.Fatalf("unexpected stat: %+v", stat)
 	}
+}
+
+func followingTestMember(videoID, authorID int64, publishedAt time.Time) string {
+	return fmt.Sprintf("%d:%d:%s", videoID, authorID, publishedAt.UTC().Format(time.RFC3339Nano))
+}
+
+func followingTestStreamItems(streams [][]string, authorIDs []int64, limit int) []*domainfeed.FeedPageItem {
+	return mergeFollowingIndexes(streams, authorIDs, limit)
+}
+
+func followingTestVideoIDs(items []*domainfeed.FeedPageItem) []int64 {
+	ids := make([]int64, 0, len(items))
+	for _, it := range items {
+		ids = append(ids, it.VideoID)
+	}
+	return ids
+}
+
+func TestMergeFollowingIndexes(t *testing.T) {
+	// 每个源必须已按 score 降序(Redis ZRevRangeByScore 的返回顺序)。
+	t1 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	inbox := []string{
+		followingTestMember(202, 2, t1),
+		followingTestMember(101, 1, t1),
+	}
+	// 大 V 10 的 outbox: 101 与 inbox 同视频同时间(score 相同); 303 是最旧的视频。
+	outboxA := []string{
+		followingTestMember(101, 10, t1),
+		followingTestMember(303, 10, t2),
+	}
+	// 作者 99 不在关注列表,应被过滤。
+	outboxB := []string{
+		followingTestMember(404, 99, t1),
+	}
+	streams := [][]string{inbox, outboxA, outboxB}
+	authorIDs := []int64{10}
+
+	t.Run("按score降序合并,去重保留inbox版,过滤非关注作者", func(t *testing.T) {
+		items := followingTestStreamItems(streams, authorIDs, 5)
+		want := []int64{202, 101, 303}
+		if got := followingTestVideoIDs(items); !slices.Equal(got, want) {
+			t.Fatalf("merge order = %v, want %v", got, want)
+		}
+		if len(items) != 3 {
+			t.Fatalf("len = %d, want 3", len(items))
+		}
+		if items[1].AuthorID != 1 {
+			t.Fatalf("video 101 kept outbox copy (author=%d), want inbox copy (author=1)", items[1].AuthorID)
+		}
+	})
+
+	t.Run("limit截断并提前终止", func(t *testing.T) {
+		items := followingTestStreamItems(streams, authorIDs, 2)
+		if got := followingTestVideoIDs(items); !slices.Equal(got, []int64{202, 101}) {
+			t.Fatalf("limit merge = %v, want [202 101]", got)
+		}
+	})
+
+	t.Run("空流返回空", func(t *testing.T) {
+		items := followingTestStreamItems([][]string{{}, {}}, nil, 5)
+		if len(items) != 0 {
+			t.Fatalf("empty streams got %v, want empty", items)
+		}
+	})
+
+	t.Run("limit<=0返回空", func(t *testing.T) {
+		items := followingTestStreamItems(streams, authorIDs, 0)
+		if len(items) != 0 {
+			t.Fatalf("limit 0 got %v, want empty", items)
+		}
+	})
 }

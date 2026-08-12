@@ -10,6 +10,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,17 +18,37 @@ const defaultLimit = 10
 const candidatePoolMultiplier = 8
 const minCandidatePoolSize = 50
 const maxCandidatePoolSize = 500
+const recallPerRouteTimeout = 500 * time.Millisecond
+const followingFreshnessBoost = 0.05
 
 var ErrLoadRecommendationFailed = errors.New("failed to load recommendations")
 var ErrLoadExposureDecisionsFailed = errors.New("failed to load exposure decisions")
 var ErrSaveRecommendationExposureFailed = errors.New("failed to save recommendation exposure")
 
 type Service struct {
-	repo domainrecommendation.Repository
-	now  func() time.Time
+	repo           domainrecommendation.Repository
+	recallers      []domainrecommendation.Recaller
+	followingBoost float64
+	now            func() time.Time
 }
 
 type Option func(*Service)
+
+// WithRecallerSet 注册多路召回器；为空时回退到旧的单路热度池。
+func WithRecallerSet(recallers []domainrecommendation.Recaller) Option {
+	return func(s *Service) {
+		if len(recallers) > 0 {
+			s.recallers = recallers
+		}
+	}
+}
+
+// WithFollowingBoost 设置关注路候选的新鲜度加成。
+func WithFollowingBoost(boost float64) Option {
+	return func(s *Service) {
+		s.followingBoost = boost
+	}
+}
 
 type CandidateRequest struct {
 	UserID    int64
@@ -108,12 +129,12 @@ func (s *Service) Recommend(ctx context.Context, input CandidateRequest) (*Candi
 	}
 
 	poolLimit := candidatePoolLimit(limit)
-	pool, err := s.repo.ListCandidatePool(ctx, req.UserID, poolLimit)
+	pool, hasUserVector, err := s.recallCandidates(ctx, req.UserID, poolLimit)
 	if err != nil {
 		return nil, ErrLoadRecommendationFailed
 	}
 
-	ranked, err := s.rankCandidates(ctx, req.UserID, pool)
+	ranked, err := s.rankCandidates(ctx, req.UserID, pool, hasUserVector)
 	if err != nil {
 		return nil, ErrLoadRecommendationFailed
 	}
@@ -223,24 +244,131 @@ func (s *Service) SaveExposures(ctx context.Context, inputs []ExposureInput) (*E
 	return &ExposureResult{Exposures: exposures}, nil
 }
 
-func (s *Service) rankCandidates(ctx context.Context, userID int64, pool []*domainrecommendation.Candidate) ([]*domainrecommendation.Candidate, error) {
+// recallCandidates 多路召回：并发执行各路召回，合并去重、配额保底、曝光剔除。
+// 单路失败/超时只丢弃该路结果（错误在路内吸收，不向 errgroup 传播），不阻塞整体；
+// 无召回器注册时回退旧的单路热度池。
+func (s *Service) recallCandidates(ctx context.Context, userID int64, poolLimit int) ([]*domainrecommendation.Candidate, bool, error) {
+	if len(s.recallers) == 0 {
+		pool, err := s.repo.ListCandidatePool(ctx, userID, poolLimit)
+		return pool, false, err
+	}
+
+	userVector, hasUserVector, err := s.repo.LoadUserInterestVector(ctx, userID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	now := s.now()
+	routes := make(map[string][]*domainrecommendation.Candidate, len(s.recallers))
+	results := make(chan []*domainrecommendation.Candidate, len(s.recallers))
+	var wg sync.WaitGroup
+	for _, recaller := range s.recallers {
+		recaller := recaller
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// 单路超时：慢查询只拖垮自己，不阻塞整个推荐接口。
+			routeCtx, cancel := context.WithTimeout(ctx, recallPerRouteTimeout)
+			defer cancel()
+			candidates, err := recaller.Recall(routeCtx, domainrecommendation.RecallInput{
+				UserID:        userID,
+				Limit:         poolLimit,
+				QueryVector:   userVector,
+				HasUserVector: hasUserVector,
+				Now:           now,
+			})
+			if err != nil {
+				return // 该路降级为空，不阻塞其他路
+			}
+			select {
+			case results <- candidates:
+			default: // 主流程已超时退出，丢弃迟到结果
+			}
+		}()
+	}
+	// 限时收集：各路 500ms 超时 + 等待余量，超时后不等没返回的路（已返回的结果照常合并）。
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(recallPerRouteTimeout + 500*time.Millisecond):
+	}
+collect:
+	for range s.recallers {
+		select {
+		case candidates := <-results:
+			for _, candidate := range candidates {
+				if candidate == nil {
+					continue
+				}
+				routes[candidate.Source] = append(routes[candidate.Source], candidate)
+			}
+		case <-time.After(recallPerRouteTimeout):
+			break collect
+		}
+	}
+
+	videoIDs := make([]int64, 0, poolLimit)
+	for _, candidates := range routes {
+		for _, candidate := range candidates {
+			if candidate != nil && candidate.VideoID > 0 {
+				videoIDs = append(videoIDs, candidate.VideoID)
+			}
+		}
+	}
+	exposures, err := s.repo.ListRecentExposures(ctx, userID, videoIDs, now.Add(-domainrecommendation.RecentExposureWindow))
+	if err != nil {
+		return nil, false, err
+	}
+	exposed := make(map[int64]bool, len(exposures))
+	for _, exposure := range exposures {
+		if exposure != nil {
+			exposed[exposure.VideoID] = true
+		}
+	}
+
+	return domainrecommendation.NewMerger(poolLimit, 0).Merge(routes, exposed), hasUserVector, nil
+}
+
+// rankCandidates 粗排：向量路候选复用召回时的相似度，其他路候选在用户有向量时补算 cosine。
+// 关注路候选给新鲜度加成，避免低热度新视频被公式压底。
+func (s *Service) rankCandidates(ctx context.Context, userID int64, pool []*domainrecommendation.Candidate, hasUserVector bool) ([]*domainrecommendation.Candidate, error) {
 	if len(pool) == 0 {
 		return []*domainrecommendation.Candidate{}, nil
 	}
 
-	videoIDs := make([]int64, 0, len(pool))
-	for _, candidate := range pool {
-		if candidate != nil && candidate.VideoID > 0 {
-			videoIDs = append(videoIDs, candidate.VideoID)
+	if !hasUserVector {
+		userVector, ok, err := s.repo.LoadUserInterestVector(ctx, userID)
+		if err != nil {
+			return nil, err
 		}
-	}
-	vectors, err := s.repo.LoadVideoVectors(ctx, videoIDs)
-	if err != nil {
-		return nil, err
-	}
-	userVector, hasUserVector, err := s.repo.LoadUserInterestVector(ctx, userID)
-	if err != nil {
-		return nil, err
+		hasUserVector = ok
+		if hasUserVector {
+			videoIDs := make([]int64, 0, len(pool))
+			for _, candidate := range pool {
+				if candidate != nil && candidate.VideoID > 0 {
+					videoIDs = append(videoIDs, candidate.VideoID)
+				}
+			}
+			vectors, err := s.repo.LoadVideoVectors(ctx, videoIDs)
+			if err != nil {
+				return nil, err
+			}
+			for _, candidate := range pool {
+				if candidate == nil {
+					continue
+				}
+				if vector := vectors[candidate.VideoID]; len(vector) > 0 {
+					similarity, err := domainembedding.CosineSimilarity(userVector, vector)
+					if err == nil {
+						candidate.Similarity = similarity
+					}
+				}
+			}
+		}
 	}
 
 	now := s.now()
@@ -251,14 +379,8 @@ func (s *Service) rankCandidates(ctx context.Context, userID int64, pool []*doma
 		}
 		value := *candidate
 		value.FreshnessScore = freshnessScore(now, value.PublishedAt)
-		value.Similarity = 0
-		if hasUserVector {
-			if vector := vectors[value.VideoID]; len(vector) > 0 {
-				similarity, err := domainembedding.CosineSimilarity(userVector, vector)
-				if err == nil {
-					value.Similarity = similarity
-				}
-			}
+		if value.Source == domainrecommendation.SourceFollowing {
+			value.FreshnessScore += s.followingBoost
 		}
 		value.RankScore = rankScore(value.Similarity, value.HotScore, value.FreshnessScore, hasUserVector)
 		value.Reason = recommendationReason(hasUserVector, value.Similarity, value.HotScore)

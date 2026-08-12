@@ -198,6 +198,107 @@ function LoginPage({ session, onNavigate }) {
   const [message, setMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
+  // JudgeX-style character animation state
+  const [mouseX, setMouseX] = useState(0);
+  const [mouseY, setMouseY] = useState(0);
+  const [showPassword, setShowPassword] = useState(false);
+  const [isTyping, setIsTyping] = useState(false);
+  const [isPurpleBlinking, setIsPurpleBlinking] = useState(false);
+  const [isBlackBlinking, setIsBlackBlinking] = useState(false);
+  const [isPurplePeeking, setIsPurplePeeking] = useState(false);
+  const [isLookingAtEachOther, setIsLookingAtEachOther] = useState(false);
+
+  const purpleRef = useRef(null);
+  const blackRef = useRef(null);
+  const yellowRef = useRef(null);
+  const orangeRef = useRef(null);
+  const purpleBlinkTimer = useRef(null);
+  const blackBlinkTimer = useRef(null);
+  const peekTimer = useRef(null);
+
+  function calcCharacterPos(ref) {
+    if (!ref?.current) return { faceX: 0, faceY: 0, bodySkew: 0 };
+    const rect = ref.current.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 3;
+    const dx = mouseX - cx;
+    const dy = mouseY - cy;
+    return {
+      faceX: Math.max(-15, Math.min(15, dx / 20)),
+      faceY: Math.max(-10, Math.min(10, dy / 30)),
+      bodySkew: Math.max(-6, Math.min(6, -dx / 120))
+    };
+  }
+
+  // blink timers
+  useEffect(() => {
+    function schedulePurpleBlink() {
+      purpleBlinkTimer.current = setTimeout(() => {
+        setIsPurpleBlinking(true);
+        setTimeout(() => {
+          setIsPurpleBlinking(false);
+          schedulePurpleBlink();
+        }, 150);
+      }, Math.random() * 4000 + 3000);
+    }
+    function scheduleBlackBlink() {
+      blackBlinkTimer.current = setTimeout(() => {
+        setIsBlackBlinking(true);
+        setTimeout(() => {
+          setIsBlackBlinking(false);
+          scheduleBlackBlink();
+        }, 150);
+      }, Math.random() * 4000 + 3000);
+    }
+    schedulePurpleBlink();
+    scheduleBlackBlink();
+    return () => {
+      clearTimeout(purpleBlinkTimer.current);
+      clearTimeout(blackBlinkTimer.current);
+    };
+  }, []);
+
+  // mouse tracking
+  useEffect(() => {
+    function onMouseMove(e) {
+      setMouseX(e.clientX);
+      setMouseY(e.clientY);
+    }
+    window.addEventListener("mousemove", onMouseMove);
+    return () => window.removeEventListener("mousemove", onMouseMove);
+  }, []);
+
+  // typing → characters look at each other
+  useEffect(() => {
+    if (isTyping) {
+      setIsLookingAtEachOther(true);
+      const t = setTimeout(() => setIsLookingAtEachOther(false), 800);
+      return () => clearTimeout(t);
+    } else {
+      setIsLookingAtEachOther(false);
+    }
+  }, [isTyping]);
+
+  // password peek scheduling
+  useEffect(() => {
+    if (form.password.length > 0 && showPassword) {
+      function schedulePeek() {
+        peekTimer.current = setTimeout(() => {
+          setIsPurplePeeking(true);
+          setTimeout(() => {
+            setIsPurplePeeking(false);
+            schedulePeek();
+          }, 800);
+        }, Math.random() * 3000 + 2000);
+      }
+      schedulePeek();
+      return () => clearTimeout(peekTimer.current);
+    } else {
+      clearTimeout(peekTimer.current);
+      setIsPurplePeeking(false);
+    }
+  }, [form.password, showPassword]);
+
   async function handleSubmit(event) {
     event.preventDefault();
     setSubmitting(true);
@@ -231,75 +332,333 @@ function LoginPage({ session, onNavigate }) {
     }
   }
 
+  const purplePos = calcCharacterPos(purpleRef);
+  const blackPos = calcCharacterPos(blackRef);
+  const yellowPos = calcCharacterPos(yellowRef);
+  const orangePos = calcCharacterPos(orangeRef);
+
+  const passwordHasContent = form.password.length > 0;
+  const hidePassword = passwordHasContent && !showPassword;
+
   return (
     <main className="auth-page">
-      <section className="auth-visual" aria-label="GCFeed">
-        <div className="auth-preview">
-          <img src={image.stage} alt="" />
-          <div className="auth-preview-card">
-            <span className="material-symbols-outlined">play_arrow</span>
-            <div>
-              <strong>GCFeed</strong>
-              <span>16:9 桌面 Feed</span>
+      <section className="auth-characters" aria-label="GCFeed Characters">
+        <div className="auth-characters-logo">
+          <div className="auth-characters-logo-icon">
+            <span className="material-symbols-outlined">auto_awesome</span>
+          </div>
+          <span>GCFeed</span>
+        </div>
+
+        <div className="auth-characters-stage">
+          <div className="auth-characters-container">
+            {/* Purple */}
+            <div
+              ref={purpleRef}
+              style={{
+                position: "absolute",
+                bottom: 0,
+                left: "70px",
+                width: "180px",
+                height: isTyping || hidePassword ? "440px" : "400px",
+                backgroundColor: "#6C3FF5",
+                borderRadius: "10px 10px 0 0",
+                zIndex: 1,
+                transform: showPassword && passwordHasContent
+                  ? "skewX(0deg)"
+                  : isTyping || hidePassword
+                    ? `skewX(${(purplePos.bodySkew || 0) - 12}deg) translateX(40px)`
+                    : `skewX(${purplePos.bodySkew || 0}deg)`,
+                transformOrigin: "bottom center",
+                transition: "all 0.7s ease-in-out"
+              }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  display: "flex",
+                  gap: "32px",
+                  left: showPassword && passwordHasContent ? "20px" : isLookingAtEachOther ? "55px" : `${45 + purplePos.faceX}px`,
+                  top: showPassword && passwordHasContent ? "35px" : isLookingAtEachOther ? "65px" : `${40 + purplePos.faceY}px`,
+                  transition: "all 0.7s ease-in-out"
+                }}
+              >
+                {[0, 1].map((k) => (
+                  <div
+                    key={k}
+                    style={{
+                      width: "18px",
+                      height: isPurpleBlinking ? "2px" : "18px",
+                      borderRadius: "50%",
+                      backgroundColor: "#fff",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      overflow: "hidden",
+                      transition: "all 0.15s"
+                    }}
+                  >
+                    {!isPurpleBlinking && (
+                      <div
+                        style={{
+                          width: "7px",
+                          height: "7px",
+                          borderRadius: "50%",
+                          backgroundColor: "#2D2D2D",
+                          transform: showPassword && passwordHasContent
+                            ? `translate(${isPurplePeeking ? 4 : -4}px, ${isPurplePeeking ? 5 : -4}px)`
+                            : isLookingAtEachOther ? "translate(3px, 4px)" : "translate(0, 0)",
+                          transition: "transform 0.1s ease-out"
+                        }}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Black */}
+            <div
+              ref={blackRef}
+              style={{
+                position: "absolute",
+                bottom: 0,
+                left: "240px",
+                width: "120px",
+                height: "310px",
+                backgroundColor: "#2D2D2D",
+                borderRadius: "8px 8px 0 0",
+                zIndex: 2,
+                transform: showPassword && passwordHasContent
+                  ? "skewX(0deg)"
+                  : isLookingAtEachOther
+                    ? `skewX(${(blackPos.bodySkew || 0) * 1.5 + 10}deg) translateX(20px)`
+                    : isTyping || hidePassword
+                      ? `skewX(${(blackPos.bodySkew || 0) * 1.5}deg)`
+                      : `skewX(${blackPos.bodySkew || 0}deg)`,
+                transformOrigin: "bottom center",
+                transition: "all 0.7s ease-in-out"
+              }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  display: "flex",
+                  gap: "24px",
+                  left: showPassword && passwordHasContent ? "10px" : isLookingAtEachOther ? "32px" : `${26 + blackPos.faceX}px`,
+                  top: showPassword && passwordHasContent ? "28px" : isLookingAtEachOther ? "12px" : `${32 + blackPos.faceY}px`,
+                  transition: "all 0.7s ease-in-out"
+                }}
+              >
+                {[0, 1].map((k) => (
+                  <div
+                    key={k}
+                    style={{
+                      width: "16px",
+                      height: isBlackBlinking ? "2px" : "16px",
+                      borderRadius: "50%",
+                      backgroundColor: "#fff",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      overflow: "hidden",
+                      transition: "all 0.15s"
+                    }}
+                  >
+                    {!isBlackBlinking && (
+                      <div
+                        style={{
+                          width: "6px",
+                          height: "6px",
+                          borderRadius: "50%",
+                          backgroundColor: "#2D2D2D",
+                          transform: showPassword && passwordHasContent
+                            ? "translate(-4px, -4px)"
+                            : isLookingAtEachOther ? "translate(0, -4px)" : "translate(0, 0)",
+                          transition: "transform 0.1s ease-out"
+                        }}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Orange */}
+            <div
+              ref={orangeRef}
+              style={{
+                position: "absolute",
+                bottom: 0,
+                left: "0px",
+                width: "240px",
+                height: "200px",
+                zIndex: 3,
+                backgroundColor: "#FF9B6B",
+                borderRadius: "120px 120px 0 0",
+                transform: showPassword && passwordHasContent ? "skewX(0deg)" : `skewX(${orangePos.bodySkew || 0}deg)`,
+                transformOrigin: "bottom center",
+                transition: "all 0.7s ease-in-out"
+              }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  display: "flex",
+                  gap: "32px",
+                  left: showPassword && passwordHasContent ? "50px" : `${82 + (orangePos.faceX || 0)}px`,
+                  top: showPassword && passwordHasContent ? "85px" : `${90 + (orangePos.faceY || 0)}px`,
+                  transition: "all 0.2s ease-out"
+                }}
+              >
+                {[0, 1].map((k) => (
+                  <div
+                    key={k}
+                    style={{
+                      width: "12px",
+                      height: "12px",
+                      borderRadius: "50%",
+                      backgroundColor: "#2D2D2D",
+                      transform: showPassword && passwordHasContent ? "translate(-5px, -4px)" : "translate(0, 0)",
+                      transition: "transform 0.1s ease-out"
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
+
+            {/* Yellow */}
+            <div
+              ref={yellowRef}
+              style={{
+                position: "absolute",
+                bottom: 0,
+                left: "310px",
+                width: "140px",
+                height: "230px",
+                zIndex: 4,
+                backgroundColor: "#E8D754",
+                borderRadius: "70px 70px 0 0",
+                transform: showPassword && passwordHasContent ? "skewX(0deg)" : `skewX(${yellowPos.bodySkew || 0}deg)`,
+                transformOrigin: "bottom center",
+                transition: "all 0.7s ease-in-out"
+              }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  display: "flex",
+                  gap: "24px",
+                  left: showPassword && passwordHasContent ? "20px" : `${52 + (yellowPos.faceX || 0)}px`,
+                  top: showPassword && passwordHasContent ? "35px" : `${40 + (yellowPos.faceY || 0)}px`,
+                  transition: "all 0.2s ease-out"
+                }}
+              >
+                {[0, 1].map((k) => (
+                  <div
+                    key={k}
+                    style={{
+                      width: "12px",
+                      height: "12px",
+                      borderRadius: "50%",
+                      backgroundColor: "#2D2D2D",
+                      transform: showPassword && passwordHasContent ? "translate(-5px, -4px)" : "translate(0, 0)",
+                      transition: "transform 0.1s ease-out"
+                    }}
+                  />
+                ))}
+              </div>
+              <div
+                style={{
+                  position: "absolute",
+                  height: "4px",
+                  borderRadius: "2px",
+                  backgroundColor: "#2D2D2D",
+                  width: "80px",
+                  left: showPassword && passwordHasContent ? "10px" : `${40 + (yellowPos.faceX || 0)}px`,
+                  top: showPassword && passwordHasContent ? "88px" : `${88 + (yellowPos.faceY || 0)}px`,
+                  transition: "all 0.2s ease-out"
+                }}
+              />
             </div>
           </div>
         </div>
-      </section>
-      <section className="auth-panel">
-        <div className="auth-card">
-          <div className="brand-block">
-            <span className="brand-mark">GC</span>
-            <div>
-              <h1>登录 GCFeed</h1>
-              <p>连接后端账号、Feed 和个人资料。</p>
-            </div>
-          </div>
 
-          <form className="auth-form" onSubmit={handleSubmit}>
-            <div className="auth-mode-tabs">
-              <button className={mode === "login" ? "active" : ""} type="button" onClick={() => setMode("login")}>
-                登录
-              </button>
-              <button className={mode === "register" ? "active" : ""} type="button" onClick={() => setMode("register")}>
-                注册
-              </button>
-            </div>
-            <label>
-              <span>账号</span>
+        <div className="auth-characters-bottom">
+          <span>GCFeed Video Platform</span>
+        </div>
+      </section>
+
+      <section className="auth-form-panel">
+        <div className="auth-form-card">
+          <h1>GCFeed</h1>
+          <p className="auth-subtitle">{mode === "login" ? "请登录你的账号" : "创建一个新账号"}</p>
+
+          <form className="auth-form-new" onSubmit={handleSubmit}>
+            <div className="auth-field">
+              <label>用户名</label>
               <input
                 value={form.account}
                 onChange={(event) => setForm({ ...form, account: event.target.value })}
-                placeholder="请输入账号"
-                autoComplete="username"
+                placeholder="输入用户名"
+                autoComplete="off"
+                required
+                onFocus={() => setIsTyping(true)}
+                onBlur={() => setIsTyping(false)}
               />
-            </label>
+            </div>
+
             {mode === "register" && (
-              <label>
-                <span>昵称</span>
+              <div className="auth-field">
+                <label>昵称</label>
                 <input
                   value={form.nickname}
                   onChange={(event) => setForm({ ...form, nickname: event.target.value })}
                   placeholder="输入昵称"
-                  autoComplete="nickname"
+                  autoComplete="off"
+                  required
                 />
-              </label>
+              </div>
             )}
-            <label>
-              <span>密码</span>
-              <input
-                value={form.password}
-                onChange={(event) => setForm({ ...form, password: event.target.value })}
-                placeholder="输入密码"
-                type="password"
-                autoComplete="current-password"
-              />
-            </label>
-            {message && <p className="form-message">{message}</p>}
-            <button className="primary-button" disabled={submitting}>
-              <span className="material-symbols-outlined">login</span>
-              {submitting ? "提交中" : mode === "register" ? "注册并登录" : "登录"}
+
+            <div className="auth-field">
+              <label>密码</label>
+              <div className="auth-password-wrap">
+                <input
+                  value={form.password}
+                  onChange={(event) => setForm({ ...form, password: event.target.value })}
+                  placeholder="••••••••"
+                  type={showPassword ? "text" : "password"}
+                  autoComplete="current-password"
+                  required
+                />
+                <button
+                  type="button"
+                  className="auth-password-toggle"
+                  onClick={() => setShowPassword(!showPassword)}
+                  tabIndex={-1}
+                >
+                  <span className="material-symbols-outlined">
+                    {showPassword ? "visibility_off" : "visibility"}
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {message && <p className="auth-error-msg">{message}</p>}
+
+            <button type="submit" className="auth-submit" disabled={submitting}>
+              {submitting ? "提交中..." : mode === "login" ? "登录" : "注册并登录"}
             </button>
           </form>
+
+          <div className="auth-mode-switch">
+            {mode === "login" ? (
+              <>还没有账号？<button type="button" onClick={() => { setMode("register"); setMessage(""); }}>注册</button></>
+            ) : (
+              <>已有账号？<button type="button" onClick={() => { setMode("login"); setMessage(""); }}>登录</button></>
+            )}
+          </div>
         </div>
       </section>
     </main>

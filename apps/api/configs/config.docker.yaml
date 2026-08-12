@@ -30,3 +30,6 @@ rabbitmq:
   exposure_exchange: "gcfeed.exposure"
   view_event_recorded_queue: "gcfeed.exposure.view_event_recorded"
   view_event_recorded_routing: "exposure.view_event_recorded"
+
+milvus:
+  address: "milvus:19530"

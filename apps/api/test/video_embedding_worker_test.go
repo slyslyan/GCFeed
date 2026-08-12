@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"sort"
 	"testing"
 	"time"
 
@@ -30,6 +31,21 @@ func (r *memoryVideoEmbeddingRepo) FindVideoEmbedding(ctx context.Context, video
 		return nil, domainembedding.ErrVideoEmbeddingNotFound
 	}
 	return cloneVideoEmbedding(item), nil
+}
+
+func (r *memoryVideoEmbeddingRepo) ListAllVideoEmbeddings(ctx context.Context, afterID int64, limit int) ([]*domainembedding.VideoEmbedding, error) {
+	var out []*domainembedding.VideoEmbedding
+	for _, item := range r.items {
+		if item.VideoID <= afterID {
+			continue
+		}
+		out = append(out, cloneVideoEmbedding(item))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].VideoID < out[j].VideoID })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func TestVideoEmbeddingWorkerWritesEmbedding(t *testing.T) {
