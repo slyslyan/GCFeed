@@ -70,6 +70,7 @@ type FeedCache interface {
 	GetStats(ctx context.Context, videoIDs []int64) (map[int64]*domainfeed.FeedStat, error)
 	SetStats(ctx context.Context, stats map[int64]*domainfeed.FeedStat, ttl time.Duration) error
 	ListHotWindowPage(ctx context.Context, windowEnd time.Time, offset int, limit int) ([]*domainfeed.FeedPageItem, error)
+	FilterDeletedVideos(ctx context.Context, videoIDs []int64) (map[int64]bool, error)
 }
 
 type FollowingIndexCache interface {
@@ -596,6 +597,18 @@ func assembleFeedItems(ctx context.Context, repo domainfeed.Repository, cache Fe
 		return []*domainfeed.FeedItem{}, nil
 	}
 
+	// 删除标记过滤:软删后卡片缓存可能仍命中,按标记剔除已删视频。
+	// 读标记失败只降级跳过过滤(DB 状态过滤仍是兜底),与 GetCards 的错误降级语义一致。
+	if cache != nil {
+		if deleted, err := cache.FilterDeletedVideos(ctx, videoIDs); err == nil && len(deleted) > 0 {
+			pageItems = excludePageItems(pageItems, deleted)
+			videoIDs = feedPageVideoIDs(pageItems)
+			if len(videoIDs) == 0 {
+				return []*domainfeed.FeedItem{}, nil
+			}
+		}
+	}
+
 	cards := map[int64]*domainfeed.FeedCard{}
 	stats := map[int64]*domainfeed.FeedStat{}
 	if cache != nil {
@@ -679,6 +692,21 @@ func assembleFeedItems(ctx context.Context, repo domainfeed.Repository, cache Fe
 		items = append(items, item)
 	}
 	return items, nil
+}
+
+// excludePageItems 剔除命中了删除标记集合的页条目。
+func excludePageItems(items []*domainfeed.FeedPageItem, deleted map[int64]bool) []*domainfeed.FeedPageItem {
+	if len(deleted) == 0 {
+		return items
+	}
+	kept := make([]*domainfeed.FeedPageItem, 0, len(items))
+	for _, item := range items {
+		if item == nil || deleted[item.VideoID] {
+			continue
+		}
+		kept = append(kept, item)
+	}
+	return kept
 }
 
 func feedPageVideoIDs(items []*domainfeed.FeedPageItem) []int64 {

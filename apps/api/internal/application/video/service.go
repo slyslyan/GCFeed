@@ -4,6 +4,7 @@ import (
 	domainvideo "GCFeed/internal/domain/video"
 	"context"
 	"errors"
+	"log"
 	"strings"
 )
 
@@ -14,10 +15,16 @@ var ErrUpdateVideoFailed = errors.New("failed to update video")
 type Service struct {
 	repo      domainvideo.Repository
 	publisher PublishedEventPublisher
+	marker    DeletedVideoMarker
 }
 
 type PublishedEventPublisher interface {
 	PublishVideoPublished(ctx context.Context, event *PublishedEvent) error
+}
+
+// DeletedVideoMarker 把已删除视频写入 Redis 删除标记集合,Feed 组装时按标记过滤。
+type DeletedVideoMarker interface {
+	MarkVideoDeleted(ctx context.Context, videoID int64) error
 }
 
 type Option func(*Service)
@@ -39,6 +46,12 @@ func New(repo domainvideo.Repository, options ...Option) *Service {
 func WithPublishedEventPublisher(publisher PublishedEventPublisher) Option {
 	return func(s *Service) {
 		s.publisher = publisher
+	}
+}
+
+func WithDeletedVideoMarker(marker DeletedVideoMarker) Option {
+	return func(s *Service) {
+		s.marker = marker
 	}
 }
 
@@ -160,6 +173,12 @@ func (s *Service) Delete(ctx context.Context, authorID, videoID int64) error {
 			return domainvideo.ErrVideoNotFound
 		}
 		return ErrUpdateVideoFailed
+	}
+	// 写删除标记是尽力而为的缓存事件:失败只记日志,删除以 DB 为准,不阻塞接口。
+	if s.marker != nil {
+		if err := s.marker.MarkVideoDeleted(ctx, videoID); err != nil {
+			log.Printf("mark video %d deleted failed: %v", videoID, err)
+		}
 	}
 	return nil
 }

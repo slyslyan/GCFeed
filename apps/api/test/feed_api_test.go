@@ -65,6 +65,7 @@ type memoryFeedCache struct {
 	hotItems       []*domainfeed.FeedPageItem
 	followingInbox map[int64][]*domainfeed.FeedPageItem
 	authorOutbox   map[int64][]*domainfeed.FeedPageItem
+	deleted        map[int64]struct{}
 }
 
 func newMemoryFeedRepo(items []*domainfeed.FeedItem) *memoryFeedRepo {
@@ -84,6 +85,7 @@ func newMemoryFeedCache() *memoryFeedCache {
 		stats:          map[int64]*domainfeed.FeedStat{},
 		followingInbox: map[int64][]*domainfeed.FeedPageItem{},
 		authorOutbox:   map[int64][]*domainfeed.FeedPageItem{},
+		deleted:        map[int64]struct{}{},
 	}
 }
 
@@ -263,6 +265,26 @@ func (c *memoryFeedCache) SetStats(ctx context.Context, stats map[int64]*domainf
 		c.stats[videoID] = &cloned
 	}
 	return nil
+}
+
+func (c *memoryFeedCache) FilterDeletedVideos(ctx context.Context, videoIDs []int64) (map[int64]bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	deleted := map[int64]bool{}
+	for _, videoID := range videoIDs {
+		if _, ok := c.deleted[videoID]; ok {
+			deleted[videoID] = true
+		}
+	}
+	return deleted, nil
+}
+
+// MarkVideoDeletedForTest 模拟删除操作写入删除标记。
+func (c *memoryFeedCache) MarkVideoDeletedForTest(videoID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deleted[videoID] = struct{}{}
 }
 
 func (c *memoryFeedCache) SetHotWindowItems(items []*domainfeed.FeedPageItem) {
@@ -713,6 +735,32 @@ func TestTimelineFeedCache(t *testing.T) {
 	decodeJSON(t, secondResponse, &secondPage)
 	if len(secondPage.Items) != 2 || secondPage.Items[0].VideoID != 3 || secondPage.Items[1].VideoID != 2 {
 		t.Fatalf("unexpected cached timeline response: %+v", secondPage)
+	}
+}
+
+// TestTimelineFeedFiltersDeletedVideos 覆盖删除标记过滤:页缓存和卡片缓存都热时,
+// 命中删除标记的视频仍必须被剔除(软删后缓存残留窗口的关闭)。
+func TestTimelineFeedFiltersDeletedVideos(t *testing.T) {
+	repo := newMemoryFeedRepo(seedFeedItems())
+	cache := newMemoryFeedCache()
+	router := newFeedRouterWithService(applicationfeed.New(repo, applicationfeed.WithFeedCache(cache)))
+
+	firstResponse := performJSONRequest(router, http.MethodGet, "/api/feed-items?scene=timeline&limit=3", "", "")
+	requireStatus(t, firstResponse, http.StatusOK)
+
+	cache.MarkVideoDeletedForTest(1)
+
+	secondResponse := performJSONRequest(router, http.MethodGet, "/api/feed-items?scene=timeline&limit=3", "", "")
+	requireStatus(t, secondResponse, http.StatusOK)
+	var page feedAPIResponse
+	decodeJSON(t, secondResponse, &page)
+	if len(page.Items) != 2 {
+		t.Fatalf("expected 2 items after delete filter, got %d: %+v", len(page.Items), page.Items)
+	}
+	for _, item := range page.Items {
+		if item.VideoID == 1 {
+			t.Fatalf("deleted video 1 still present in feed: %+v", page.Items)
+		}
 	}
 }
 

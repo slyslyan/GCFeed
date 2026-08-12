@@ -26,6 +26,10 @@ const actionStatJSONTTL = 15 * time.Second
 const actionStatCounterShardCount = 16
 const followingIndexKeyTTL = 30 * 24 * time.Hour
 
+// 删除标记 TTL 必须大于卡片缓存 TTL(15 分钟),否则标记先过期会重现残留窗口。
+const deletedVideoMarkerTTL = 30 * time.Minute
+const deletedVideoSetKey = "video:deleted:v1"
+
 type redisWatchCmdable interface {
 	redis.Cmdable
 	Pipeline() redis.Pipeliner
@@ -142,6 +146,45 @@ func (c *FeedCache) SetCards(ctx context.Context, cards map[int64]*domainfeed.Fe
 	_, err := pipe.Exec(ctx)
 	inframetrics.ObserveCacheWrite("card", len(cards), err)
 	return err
+}
+
+// MarkVideoDeleted 把已删除视频写入 Redis 删除标记集合,Feed 组装时按标记过滤,
+// 关闭软删后卡片缓存残留窗口。标记是尽力而为的缓存写,失败不影响删除本身。
+// 注意: 若未来增加"恢复发布"流程,恢复时必须 SREM 移出标记,否则恢复后仍被过滤。
+func (c *FeedCache) MarkVideoDeleted(ctx context.Context, videoID int64) error {
+	if videoID <= 0 {
+		return nil
+	}
+	pipe := c.client.Pipeline()
+	pipe.SAdd(ctx, deletedVideoSetKey, videoID)
+	pipe.Expire(ctx, deletedVideoSetKey, deletedVideoMarkerTTL)
+	_, err := pipe.Exec(ctx)
+	inframetrics.ObserveCacheWrite("deleted_video", 1, err)
+	return err
+}
+
+// FilterDeletedVideos 批量检查 videoIDs 中哪些命中了删除标记集合。
+func (c *FeedCache) FilterDeletedVideos(ctx context.Context, videoIDs []int64) (map[int64]bool, error) {
+	deleted := map[int64]bool{}
+	if len(videoIDs) == 0 {
+		return deleted, nil
+	}
+	members := make([]interface{}, 0, len(videoIDs))
+	for _, videoID := range videoIDs {
+		members = append(members, videoID)
+	}
+	flags, err := c.client.SMIsMember(ctx, deletedVideoSetKey, members...).Result()
+	if err != nil {
+		inframetrics.ObserveCacheRead("deleted_video", len(videoIDs), 0, err)
+		return nil, err
+	}
+	for index, flag := range flags {
+		if flag {
+			deleted[videoIDs[index]] = true
+		}
+	}
+	inframetrics.ObserveCacheRead("deleted_video", len(videoIDs), len(deleted), nil)
+	return deleted, nil
 }
 
 // GetStats 批量读取视频计数缓存。
