@@ -590,7 +590,7 @@
 
 1. 用户注册、登录和获取当前用户信息的接口是什么？
 
-   答：注册是 `POST /api/users`，登录是 `POST /api/sessions`，获取当前用户是 `GET /api/users/me`。登录成功后返回 access_token，客户端通过 Authorization Bearer 携带。更新当前用户资料使用 `PATCH /api/users/me`。
+   答：注册是 `POST /api/users`，登录是 `POST /api/sessions`，获取当前用户是 `GET /api/users/me`。登录成功后返回 access_token，客户端通过 Authorization Bearer 携带；同时通过 httpOnly Cookie 下发 refresh token。更新当前用户资料使用 `PATCH /api/users/me`。
 
 2. JWT 中间件如何把用户身份传给 Handler？
 
@@ -612,11 +612,13 @@
 
 1. JWT 泄露后如何降低风险？
 
-   答：access token 设置较短有效期，敏感操作增加二次校验。服务端可以维护 token 黑名单或用户会话版本，在用户改密、登出或风控时失效旧 token。HTTPS、HttpOnly cookie 和设备管理也能降低泄露风险。
+   答：access token 设置较短有效期（本项目 15 分钟），敏感操作增加二次校验。本项目已落地双 token 方案：refresh token 存服务端会话表（只存 SHA-256 哈希），登出/风控时撤销数据库行即可拒绝续签；每次刷新强制轮换，旧 token 立即失效，已轮换的旧 token 再次出现会被判定重用并整族撤销。HTTPS、HttpOnly cookie 和设备管理也能降低泄露风险。
 
 2. Access token 和 refresh token 如何设计？
 
-   答：access token 生命周期短，用于 API 鉴权；refresh token 生命周期长，用于换取新的 access token。refresh token 存服务端会话表或 Redis，支持撤销、轮换和设备维度管理。刷新时生成新的 token 并更新会话状态。
+   答：本项目已实现：access token 是 15 分钟 HS256 JWT（无状态，业务接口直接用）；refresh token 是 32 字节随机串（opaque，不是 JWT），数据库只存 SHA-256 哈希，属于 `refresh_token` 表。每个 refresh token 属于一个 family（登录创建），刷新走 `POST /api/sessions/refresh`：服务端按哈希查库校验未撤销未过期，然后 CAS 事务轮换——旧行写 revoked_at + 插入同 family 新行；CAS 失败说明被并发刷新过，按重用处理并整族撤销（防止双 token 双活）。refresh token 通过 httpOnly + SameSite=Lax Cookie 下发，前端 JS 读不到。服务端拒绝续签（撤销行）即实现踢设备下线。登出 `DELETE /api/sessions/current` 只凭 Cookie 撤销当前会话，不依赖 access token。
+
+   诚实边界：① 登出/撤族后旧 access token 在剩余 15 分钟内仍可用（无状态 JWT 固有，要立即吊销需引入 access 黑名单）；② 多标签页并发刷新会误杀整个 family，用户需重新登录（严格单活语义，与 Auth0 一致）；③ Cookie Secure 属性生产环境必须开启，本地 http 开发环境不设，否则浏览器拒绝存储。
 
 3. 内部 token 如何轮换？
 
@@ -628,7 +630,7 @@
 
 5. Handler 中如何区分 401 和 403？
 
-   答：401 表示身份缺失或 token 校验失败，用户需要重新登录。403 表示身份有效，当前用户权限等级低于目标操作要求，例如删除他人评论或访问内部资源。Handler 根据中间件结果和领域权限错误映射状态码。
+   答：401 表示身份缺失或 token 校验失败，用户需要重新登录。前端收到 401 会先无感调一次 refresh 接口（凭 httpOnly Cookie）换新 access token 并重试原请求，刷新也失败才清登录态跳登录页；sessions 接口自身不做重试，避免刷新循环。403 表示身份有效，当前用户权限等级低于目标操作要求，例如删除他人评论或访问内部资源。Handler 根据中间件结果和领域权限错误映射状态码。
 
 ## 14. 数据库与索引
 

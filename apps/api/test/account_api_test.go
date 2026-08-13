@@ -12,6 +12,7 @@ import (
 	applicationaccount "GCFeed/internal/application/account"
 	domainaccount "GCFeed/internal/domain/account"
 	infrajwt "GCFeed/internal/infra/jwt"
+	infrarefreshtoken "GCFeed/internal/infra/refreshtoken"
 	interfaceshttpaccount "GCFeed/internal/interfaces/http/account"
 	interfaceshttpmiddleware "GCFeed/internal/interfaces/http/middleware"
 
@@ -253,7 +254,7 @@ func TestAccountAPIValidation(t *testing.T) {
 
 // TestPublicAccountProfile 覆盖公开用户主页资料中的关注数、粉丝数和作品数。
 func TestPublicAccountProfile(t *testing.T) {
-	router, repo := newAccountRouterWithRepo(t)
+	router, repo, _ := newAccountRouterWithRepo(t)
 
 	registerResponse := performJSONRequest(
 		router,
@@ -310,11 +311,11 @@ func registerAndLogin(t *testing.T, router *gin.Engine) string {
 
 // newAccountRouter 只装配账号相关路由，使测试聚焦账号模块。
 func newAccountRouter(t *testing.T) *gin.Engine {
-	router, _ := newAccountRouterWithRepo(t)
+	router, _, _ := newAccountRouterWithRepo(t)
 	return router
 }
 
-func newAccountRouterWithRepo(t *testing.T) (*gin.Engine, *memoryAccountRepo) {
+func newAccountRouterWithRepo(t *testing.T) (*gin.Engine, *memoryAccountRepo, *memorySessionRepo) {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
@@ -324,16 +325,22 @@ func newAccountRouterWithRepo(t *testing.T) (*gin.Engine, *memoryAccountRepo) {
 	if err != nil {
 		t.Fatalf("new jwt manager: %v", err)
 	}
+	refreshGen, err := infrarefreshtoken.NewGenerator("168h")
+	if err != nil {
+		t.Fatalf("new refresh generator: %v", err)
+	}
 	repo := newMemoryAccountRepo()
-	service := applicationaccount.New(repo, jwtManager)
-	handler := interfaceshttpaccount.New(service)
+	sessionRepo := newMemorySessionRepo()
+	service := applicationaccount.New(repo, jwtManager, refreshGen, sessionRepo)
+	handler := interfaceshttpaccount.New(service, false, refreshGen.TTL())
 	authMiddleware := interfaceshttpmiddleware.NewJWTAuth(jwtManager)
 
 	api := router.Group("/api")
 	// 测试路由保持和正式 RESTful 路由一致，便于测试覆盖真实接口路径。
 	sessions := api.Group("/sessions")
 	sessions.POST("", handler.Login)
-	sessions.DELETE("/current", authMiddleware, handler.Logout)
+	sessions.POST("/refresh", handler.Refresh)
+	sessions.DELETE("/current", handler.Logout)
 
 	users := api.Group("/users")
 	users.POST("", handler.Register)
@@ -341,7 +348,7 @@ func newAccountRouterWithRepo(t *testing.T) (*gin.Engine, *memoryAccountRepo) {
 	users.PATCH("/me", authMiddleware, handler.UpdateMe)
 	users.GET("/:userId", handler.Get)
 
-	return router, repo
+	return router, repo, sessionRepo
 }
 
 // performJSONRequest 构造 JSON 请求，并在需要时附加 Bearer token。

@@ -4,6 +4,7 @@ package infraconfig
 type Config struct {
 	Port     int            `yaml:"port"`
 	JWT      JWTConfig      `yaml:"jwt"`
+	Cookie   CookieConfig   `yaml:"cookie"`
 	Internal InternalConfig `yaml:"internal"`
 	Database DatabaseConfig `yaml:"database"`
 	Redis    RedisConfig    `yaml:"redis"`
@@ -11,10 +12,17 @@ type Config struct {
 	Milvus   MilvusConfig   `yaml:"milvus"`
 }
 
-// JWTConfig 保存 JWT 签名密钥和访问 token 有效期。
+// JWTConfig 保存 JWT 签名密钥和 access/refresh token 有效期。
 type JWTConfig struct {
-	Secret    string `yaml:"secret"`
-	AccessTTL string `yaml:"access_ttl"`
+	Secret     string `yaml:"secret"`
+	AccessTTL  string `yaml:"access_ttl"`
+	RefreshTTL string `yaml:"refresh_ttl"`
+}
+
+// CookieConfig 控制 refresh token Cookie 的 Secure 属性:
+// 开发环境 http 下浏览器拒绝 Secure Cookie,生产 https 必须开启。
+type CookieConfig struct {
+	Secure bool `yaml:"secure"`
 }
 
 // InternalConfig 保存内部接口服务鉴权配置。

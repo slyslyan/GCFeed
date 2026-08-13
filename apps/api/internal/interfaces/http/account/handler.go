@@ -5,21 +5,34 @@ import (
 	domainaccount "GCFeed/internal/domain/account"
 	interfaceshttpmiddleware "GCFeed/internal/interfaces/http/middleware"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	// RefreshTokenCookieName 是 refresh token Cookie 名,HttpOnly 防 JS 读取。
+	RefreshTokenCookieName = "gcfeed_refresh_token"
+	// refreshCookiePath 限定在 sessions 前缀携带,减少其余请求的传输暴露。
+	refreshCookiePath = "/api/sessions"
+)
+
 type Handler struct {
-	service *applicationaccount.Service
+	service       *applicationaccount.Service
+	secureCookie  bool
+	refreshMaxAge int
 }
 
 // New 注入账号应用服务，Handler 只处理 HTTP 输入输出。
-func New(service *applicationaccount.Service) *Handler {
+func New(service *applicationaccount.Service, secureCookie bool, refreshTTL time.Duration) *Handler {
 	return &Handler{
-		service: service,
+		service:       service,
+		secureCookie:  secureCookie,
+		refreshMaxAge: int(refreshTTL.Seconds()),
 	}
 }
 
@@ -72,6 +85,7 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	h.setRefreshCookie(c, token.RefreshToken)
 	c.JSON(http.StatusOK, tokenResponse{
 		AccessToken:      token.AccessToken,
 		TokenType:        token.TokenType,
@@ -79,9 +93,52 @@ func (h *Handler) Login(c *gin.Context) {
 	})
 }
 
-// Logout 当前项目使用无状态 JWT，服务端无需清理会话数据。
+// Refresh 用 Cookie 里的 refresh token 换新 token 对:校验 + 轮换都由应用层完成。
+// 任何失败统一 401 且清 Cookie,不区分错误枚举,防止探测有效 token。
+func (h *Handler) Refresh(c *gin.Context) {
+	plainToken, _ := c.Cookie(RefreshTokenCookieName)
+	token, err := h.service.Refresh(c.Request.Context(), plainToken)
+	if err != nil {
+		h.clearRefreshCookie(c)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "refresh token invalid"})
+		return
+	}
+
+	h.setRefreshCookie(c, token.RefreshToken)
+	c.JSON(http.StatusOK, tokenResponse{
+		AccessToken:      token.AccessToken,
+		TokenType:        token.TokenType,
+		ExpiresInSeconds: token.ExpiresInSeconds,
+	})
+}
+
+// Logout 只凭 refresh Cookie 撤销当前会话,不依赖 access token——
+// access 过期后仍能真正登出;没有 Cookie 也返回 204 保持幂等。
 func (h *Handler) Logout(c *gin.Context) {
+	plainToken, _ := c.Cookie(RefreshTokenCookieName)
+	_ = h.service.Logout(c.Request.Context(), plainToken)
+	h.clearRefreshCookie(c)
 	c.Status(http.StatusNoContent)
+}
+
+// setRefreshCookie 手写 Set-Cookie 头,gin 的 SetCookie 不暴露 SameSite 属性。
+func (h *Handler) setRefreshCookie(c *gin.Context, plainToken string) {
+	attributes := []string{
+		RefreshTokenCookieName + "=" + plainToken,
+		"Path=" + refreshCookiePath,
+		"Max-Age=" + strconv.Itoa(h.refreshMaxAge),
+		"HttpOnly",
+		"SameSite=Lax",
+	}
+	if h.secureCookie {
+		attributes = append(attributes, "Secure")
+	}
+	c.Header("Set-Cookie", strings.Join(attributes, "; "))
+}
+
+// clearRefreshCookie 清除 refresh Cookie,刷新失败和登出都会调用。
+func (h *Handler) clearRefreshCookie(c *gin.Context) {
+	c.Header("Set-Cookie", fmt.Sprintf("%s=; Path=%s; Max-Age=0; HttpOnly; SameSite=Lax", RefreshTokenCookieName, refreshCookiePath))
 }
 
 // Me 读取当前登录用户资料，用户 ID 来自 JWT 中间件写入的上下文。

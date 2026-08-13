@@ -48,6 +48,15 @@ function App() {
   const [user, setUser] = useState(() => readStoredUser());
   const [unreadCount, setUnreadCount] = useState(0);
 
+  // apiRequest 是无状态模块函数,这里注册刷新成功后的回调:回写 token 状态与 localStorage。
+  useEffect(() => {
+    registerSessionRefreshHandler((nextToken) => {
+      setToken(nextToken);
+      localStorage.setItem(TOKEN_KEY, nextToken);
+    });
+    return () => registerSessionRefreshHandler(null);
+  }, []);
+
   useEffect(() => {
     const handlePopState = () => setRoute(normalizeRoute(window.location.pathname));
     window.addEventListener("popstate", handlePopState);
@@ -2646,12 +2655,10 @@ function navigate(path, setRoute) {
 }
 
 function logout(session, setRoute) {
-  if (session.token) {
-    apiRequest("/api/sessions/current", {
-      method: "DELETE",
-      token: session.token
-    }).catch(() => {});
-  }
+  // 登出凭 refresh Cookie 撤销服务端会话,不依赖 access token——过期了也能真正登出。
+  apiRequest("/api/sessions/current", {
+    method: "DELETE"
+  }).catch(() => {});
   session.clearAuth();
   navigate("/timeline", setRoute);
 }
@@ -2993,7 +3000,32 @@ function savePublicProfile(profile) {
   localStorage.setItem(PUBLIC_PROFILE_KEY, JSON.stringify(profiles));
 }
 
-async function apiRequest(path, options = {}) {
+// refreshPromise 做单飞:并发 401 只发一次刷新请求,避免刷新风暴。
+let refreshPromise = null;
+// onAccessTokenRefreshed 由 App 组件注册,刷新成功后回写 React 状态和 localStorage。
+let onAccessTokenRefreshed = null;
+
+function registerSessionRefreshHandler(handler) {
+  onAccessTokenRefreshed = handler;
+}
+
+// tryRefreshSession 凭 httpOnly Cookie 调刷新接口,失败返回 null 交给调用点处理。
+async function tryRefreshSession() {
+  if (!refreshPromise) {
+    refreshPromise = fetch("/api/sessions/refresh", {
+      method: "POST",
+      credentials: "same-origin"
+    })
+      .then((response) => (response.ok ? response.json() : null))
+      .catch(() => null)
+      .finally(() => {
+        refreshPromise = null;
+      });
+  }
+  return refreshPromise;
+}
+
+async function apiRequest(path, options = {}, retried = false) {
   const headers = {
     Accept: "application/json",
     ...(options.headers || {})
@@ -3018,6 +3050,15 @@ async function apiRequest(path, options = {}) {
     }
     const error = new Error(message);
     error.status = response.status;
+
+    // 401 时先尝试无感刷新一次再重试;sessions 接口自身不重试,避免刷新循环。
+    if (response.status === 401 && !retried && !path.startsWith("/api/sessions")) {
+      const refreshed = await tryRefreshSession();
+      if (refreshed && refreshed.access_token) {
+        if (onAccessTokenRefreshed) onAccessTokenRefreshed(refreshed.access_token);
+        return apiRequest(path, { ...options, token: refreshed.access_token }, true);
+      }
+    }
     throw error;
   }
 

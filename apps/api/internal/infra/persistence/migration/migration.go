@@ -9,6 +9,7 @@ import (
 	inframessage "GCFeed/internal/infra/persistence/message"
 	infraplayback "GCFeed/internal/infra/persistence/playback"
 	infrarelation "GCFeed/internal/infra/persistence/relation"
+	infrasession "GCFeed/internal/infra/persistence/session"
 	infravideo "GCFeed/internal/infra/persistence/video"
 	"errors"
 	"time"
@@ -45,6 +46,7 @@ func autoMigrateModels(db *gorm.DB) error {
 			&infraplayback.QoSLogModel{},
 			&infrarelation.FollowModel{},
 			&infrarelation.RelationStatModel{},
+			&infrasession.RefreshTokenModel{},
 		)
 		if err == nil {
 			return nil

@@ -57,7 +57,7 @@ func NewManager(secret, accessTTL string) (*Manager, error) {
 		return nil, ErrEmptyJWTSecret
 	}
 
-	accessDuration, err := parseTTL(accessTTL, defaultAccessTTL)
+	accessDuration, err := ParseTTL(accessTTL, defaultAccessTTL)
 	if err != nil {
 		return nil, ErrParseAccessTTL
 	}
@@ -153,8 +153,8 @@ func (m *Manager) signToken(userID int64, role, tokenType string, ttl time.Durat
 	return signedToken, nil
 }
 
-// parseTTL 解析配置里的时间字符串，例如 15m、1h。
-func parseTTL(raw string, fallback time.Duration) (time.Duration, error) {
+// ParseTTL 解析配置里的时间字符串，例如 15m、1h，供 JWT 与 refresh token 共用。
+func ParseTTL(raw string, fallback time.Duration) (time.Duration, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return fallback, nil

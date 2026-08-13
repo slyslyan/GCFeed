@@ -25,7 +25,9 @@ import (
 	infraplayback "GCFeed/internal/infra/persistence/playback"
 	infrarecommendation "GCFeed/internal/infra/persistence/recommendation"
 	infrarelation "GCFeed/internal/infra/persistence/relation"
+	infrasession "GCFeed/internal/infra/persistence/session"
 	infravideo "GCFeed/internal/infra/persistence/video"
+	infrarefreshtoken "GCFeed/internal/infra/refreshtoken"
 	infravector "GCFeed/internal/infra/vector"
 	interfaceshttpaccount "GCFeed/internal/interfaces/http/account"
 	interfaceshttpexposure "GCFeed/internal/interfaces/http/exposure"
@@ -72,8 +74,13 @@ func Register(g *gin.Engine, cfg *infraconfig.Config, db *sql.DB) error {
 
 	// 下面按领域模块组装依赖：Repository -> Service -> Handler。
 	accountRepo := infraaccount.New(gormDB)
-	accountService := applicationaccount.New(accountRepo, jwtManager)
-	accountHandler := interfaceshttpaccount.New(accountService)
+	refreshGen, err := infrarefreshtoken.NewGenerator(cfg.JWT.RefreshTTL)
+	if err != nil {
+		return err
+	}
+	sessionRepo := infrasession.New(gormDB)
+	accountService := applicationaccount.New(accountRepo, jwtManager, refreshGen, sessionRepo)
+	accountHandler := interfaceshttpaccount.New(accountService, cfg.Cookie.Secure, refreshGen.TTL())
 	videoRepo := infravideo.New(gormDB)
 	feedRepo := infrafeed.New(gormDB)
 	recommendationRepo := infrarecommendation.New(gormDB)
@@ -155,10 +162,12 @@ func Register(g *gin.Engine, cfg *infraconfig.Config, db *sql.DB) error {
 	api := g.Group("/api")
 
 	// RESTful 路由约定：路径表达资源，HTTP 方法表达动作。
-	// 会话资源用于登录态：创建会话表示登录，删除当前会话表示登出。
+	// 会话资源用于登录态：创建会话表示登录，刷新会话换新 token，删除当前会话表示登出。
 	sessions := api.Group("/sessions")
 	sessions.POST("", accountHandler.Login)
-	sessions.DELETE("/current", authMiddleware, accountHandler.Logout)
+	sessions.POST("/refresh", accountHandler.Refresh)
+	// 登出凭 refresh Cookie 撤销会话，不依赖 access token，所以不需要鉴权中间件。
+	sessions.DELETE("/current", accountHandler.Logout)
 
 	// 用户资源承载注册、当前用户资料和用户作品列表。
 	users := api.Group("/users")
