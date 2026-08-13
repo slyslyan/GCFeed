@@ -1,12 +1,15 @@
 package infracache
 
 import (
+	applicationinteraction "GCFeed/internal/application/interaction"
 	domainfeed "GCFeed/internal/domain/feed"
 	domaininteraction "GCFeed/internal/domain/interaction"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -253,6 +256,115 @@ func TestMergeFollowingIndexes(t *testing.T) {
 		items := followingTestStreamItems(streams, authorIDs, 0)
 		if len(items) != 0 {
 			t.Fatalf("limit 0 got %v, want empty", items)
+		}
+	})
+}
+
+// TestSetActionStateLua 用真实 Redis 验证 Lua 脚本状态机语义,与 memoryActionPipeline 行为一致:
+// 首次点赞、幂等、状态翻转、初始计数初始化、并发原子性。无 TEST_REDIS_ADDR 时跳过。
+func TestSetActionStateLua(t *testing.T) {
+	addr := os.Getenv("TEST_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("TEST_REDIS_ADDR not set, skip Redis integration test")
+	}
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+	cache := NewFeedCache(client)
+
+	t.Run("首次点赞与幂等与翻转", func(t *testing.T) {
+		videoID := int64(7001)
+		userID := int64(70001)
+		initialStat := &domaininteraction.VideoStat{VideoID: videoID, LikeCount: 100, CommentCount: 20, FavoriteCount: 30}
+
+		first, err := cache.SetActionState(ctx, userID, videoID, domaininteraction.ActionTypeLike, true, "idem-1", initialStat)
+		if err != nil {
+			t.Fatalf("SetActionState: %v", err)
+		}
+		if !first.Active || first.Delta != 1 || first.LikeCount != 101 {
+			t.Fatalf("unexpected first like result: %+v", first)
+		}
+		shardKey := interactionStatCounterShardKey(videoID, interactionStatCounterShardIndex(userID))
+		if got := client.HGet(ctx, shardKey, "like_count").Val(); got != "1" {
+			t.Fatalf("shard like_count = %q, want 1", got)
+		}
+		if got := client.HGet(ctx, interactionStatCounterBaseKey(videoID), "like_count").Val(); got != "100" {
+			t.Fatalf("base like_count = %q, want 100 (HSetNX 保留初始值)", got)
+		}
+
+		repeat, err := cache.SetActionState(ctx, userID, videoID, domaininteraction.ActionTypeLike, true, "idem-1", initialStat)
+		if err != nil {
+			t.Fatalf("SetActionState: %v", err)
+		}
+		if repeat.Delta != 0 || !repeat.Active {
+			t.Fatalf("expected idempotent no-op, got %+v", repeat)
+		}
+
+		cancel, err := cache.SetActionState(ctx, userID, videoID, domaininteraction.ActionTypeLike, false, "idem-2", initialStat)
+		if err != nil {
+			t.Fatalf("SetActionState: %v", err)
+		}
+		if cancel.Delta != -1 || cancel.Active {
+			t.Fatalf("expected cancel delta -1, got %+v", cancel)
+		}
+		if got := client.HGet(ctx, shardKey, "like_count").Val(); got != "0" {
+			t.Fatalf("shard like_count = %q, want 0", got)
+		}
+	})
+
+	t.Run("并发点赞恰好只计数一次", func(t *testing.T) {
+		videoID := int64(7002)
+		userID := int64(70002)
+		const workers = 10
+
+		results := make(chan *applicationinteraction.ActionStateResult, workers)
+		errs := make(chan error, workers)
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				result, err := cache.SetActionState(ctx, userID, videoID, domaininteraction.ActionTypeLike, true, "", nil)
+				if err != nil {
+					errs <- err
+					return
+				}
+				results <- result
+			}()
+		}
+		wg.Wait()
+		close(results)
+		close(errs)
+		for err := range errs {
+			t.Fatalf("SetActionState: %v", err)
+		}
+
+		totalDelta := 0
+		allActive := true
+		for result := range results {
+			totalDelta += result.Delta
+			allActive = allActive && result.Active
+		}
+		// 脚本原子串行: 第一个把状态置为 active,其余 9 个看到状态已匹配 → delta=0。
+		if totalDelta != 1 || !allActive {
+			t.Fatalf("concurrent likes: totalDelta=%d allActive=%v, want 1 true", totalDelta, allActive)
+		}
+		shardKey := interactionStatCounterShardKey(videoID, interactionStatCounterShardIndex(userID))
+		if got := client.HGet(ctx, shardKey, "like_count").Val(); got != "1" {
+			t.Fatalf("shard like_count = %q, want 1", got)
+		}
+	})
+
+	t.Run("首次取消不计数", func(t *testing.T) {
+		videoID := int64(7003)
+		userID := int64(70003)
+
+		cancel, err := cache.SetActionState(ctx, userID, videoID, domaininteraction.ActionTypeFavorite, false, "", nil)
+		if err != nil {
+			t.Fatalf("SetActionState: %v", err)
+		}
+		if cancel.Delta != 0 || cancel.Active {
+			t.Fatalf("expected first cancel delta 0, got %+v", cancel)
 		}
 	})
 }

@@ -30,11 +30,61 @@ const followingIndexKeyTTL = 30 * 24 * time.Hour
 const deletedVideoMarkerTTL = 30 * time.Minute
 const deletedVideoSetKey = "video:deleted:v1"
 
-type redisWatchCmdable interface {
+type redisCacheClient interface {
 	redis.Cmdable
 	Pipeline() redis.Pipeliner
-	Watch(ctx context.Context, fn func(*redis.Tx) error, keys ...string) error
 }
+
+// actionStateScript 把"读状态 → 算 delta → 写状态与计数"收进一个 Lua 脚本原子执行,
+// 替代 WATCH+MULTI 乐观锁: 一次往返、无需重试、无竞态窗口。
+// 注意: EVAL 要求全部 key 落在同一哈希槽,Redis Cluster 下必须重新设计 key 布局。
+var actionStateScript = redis.NewScript(`
+local stored = redis.call('HGETALL', KEYS[1])
+local storedStatus = 0
+local storedIDKey = ''
+for i = 1, #stored, 2 do
+	if stored[i] == 'status' then
+		storedStatus = tonumber(stored[i + 1]) or 0
+	elseif stored[i] == 'idempotency_key' then
+		storedIDKey = stored[i + 1] or ''
+	end
+end
+
+local active = tonumber(ARGV[1]) == 1
+local targetStatus = tonumber(ARGV[2])
+local idempotencyKey = ARGV[3]
+local delta = 0
+local effectiveStatus = targetStatus
+
+if storedIDKey == idempotencyKey and idempotencyKey ~= '' then
+	effectiveStatus = storedStatus
+elseif storedStatus == 0 then
+	if active then delta = 1 end
+elseif storedStatus ~= targetStatus then
+	if active then delta = 1 else delta = -1 end
+end
+
+redis.call('HSET', KEYS[1], 'status', effectiveStatus, 'idempotency_key', idempotencyKey, 'updated_at', ARGV[4])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+
+if redis.call('HEXISTS', KEYS[2], 'like_count') == 0 then
+	redis.call('HSET', KEYS[2], 'like_count', ARGV[6])
+end
+if redis.call('HEXISTS', KEYS[2], 'comment_count') == 0 then
+	redis.call('HSET', KEYS[2], 'comment_count', ARGV[7])
+end
+if redis.call('HEXISTS', KEYS[2], 'favorite_count') == 0 then
+	redis.call('HSET', KEYS[2], 'favorite_count', ARGV[8])
+end
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[9]))
+
+if delta ~= 0 then
+	redis.call('HINCRBY', KEYS[3], ARGV[10], delta)
+end
+redis.call('EXPIRE', KEYS[3], tonumber(ARGV[9]))
+
+return {effectiveStatus, delta}
+`)
 
 type redisActionStatReader interface {
 	HGetAll(ctx context.Context, key string) *redis.MapStringStringCmd
@@ -53,11 +103,11 @@ type redisStatCacheClient interface {
 
 // FeedCache 使用 Redis 保存 Feed 查询结果。
 type FeedCache struct {
-	client redisWatchCmdable
+	client redisCacheClient
 }
 
 // NewFeedCache 创建 Feed 结果缓存。
-func NewFeedCache(client redisWatchCmdable) *FeedCache {
+func NewFeedCache(client redisCacheClient) *FeedCache {
 	return &FeedCache{client: client}
 }
 
@@ -458,6 +508,7 @@ func (c *FeedCache) listHotWindowPage(ctx context.Context, windowKey string, off
 }
 
 // SetActionState 写入 Redis 行为状态和实时计数，供点赞收藏接口快速返回。
+// 读-算-写由 Lua 脚本原子完成,不再依赖 WATCH+MULTI 的乐观锁与重试。
 func (c *FeedCache) SetActionState(ctx context.Context, userID int64, videoID int64, actionType string, active bool, idempotencyKey string, initialStat *domaininteraction.VideoStat) (*applicationinteraction.ActionStateResult, error) {
 	actionType, err := domaininteraction.NormalizeActionType(actionType)
 	if err != nil {
@@ -474,68 +525,45 @@ func (c *FeedCache) SetActionState(ctx context.Context, userID int64, videoID in
 		targetStatus = domaininteraction.ActionStatusActive
 	}
 
-	var result *applicationinteraction.ActionStateResult
-	err = c.client.Watch(ctx, func(tx *redis.Tx) error {
-		values, err := tx.HGetAll(ctx, actionKey).Result()
-		if err != nil {
-			return err
-		}
+	baseStat := actionStatBaseInit(videoID, initialStat)
 
-		storedStatus, _ := strconv.Atoi(values["status"])
-		storedIDKey := values["idempotency_key"]
-		effectiveActive := active
-		effectiveStatus := targetStatus
-		delta := 0
-		if storedIDKey == idempotencyKey && idempotencyKey != "" {
-			effectiveActive = storedStatus == domaininteraction.ActionStatusActive
-			effectiveStatus = storedStatus
-			delta = 0
-		} else {
-			if storedStatus == 0 {
-				if active {
-					delta = 1
-				}
-			} else if storedStatus != targetStatus {
-				if active {
-					delta = 1
-				} else {
-					delta = -1
-				}
-			}
-		}
+	activeFlag := 0
+	if active {
+		activeFlag = 1
+	}
 
-		baseStat := actionStatBaseInit(videoID, initialStat)
-
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.HSet(ctx, actionKey, map[string]any{
-				"status":          effectiveStatus,
-				"idempotency_key": idempotencyKey,
-				"updated_at":      time.Now().UTC().Format(time.RFC3339Nano),
-			})
-			pipe.Expire(ctx, actionKey, actionStateTTL)
-			queueActionStatBaseInit(ctx, pipe, counterBaseKey, baseStat)
-			pipe.Expire(ctx, counterBaseKey, actionStatTTL)
-			if delta != 0 {
-				pipe.HIncrBy(ctx, counterShardKey, interactionStatField(actionType), int64(delta))
-			}
-			pipe.Expire(ctx, counterShardKey, actionStatTTL)
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		result = &applicationinteraction.ActionStateResult{
-			VideoID:        videoID,
-			ActionType:     actionType,
-			Active:         effectiveActive,
-			Delta:          delta,
-			IdempotencyKey: idempotencyKey,
-		}
-		return nil
-	}, actionKey)
+	values, err := actionStateScript.Run(ctx, c.client, []string{actionKey, counterBaseKey, counterShardKey},
+		activeFlag,
+		targetStatus,
+		idempotencyKey,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		int64(actionStateTTL/time.Second),
+		baseStat.LikeCount,
+		baseStat.CommentCount,
+		baseStat.FavoriteCount,
+		int64(actionStatTTL/time.Second),
+		interactionStatField(actionType),
+	).Result()
 	if err != nil {
 		return nil, err
+	}
+
+	parts, ok := values.([]interface{})
+	if !ok || len(parts) < 2 {
+		return nil, fmt.Errorf("unexpected action state lua result: %v", values)
+	}
+	effectiveStatus, ok1 := parts[0].(int64)
+	delta, ok2 := parts[1].(int64)
+	if !ok1 || !ok2 {
+		return nil, fmt.Errorf("unexpected action state lua result: %v", values)
+	}
+
+	result := &applicationinteraction.ActionStateResult{
+		VideoID:        videoID,
+		ActionType:     actionType,
+		Active:         effectiveStatus == domaininteraction.ActionStatusActive,
+		Delta:          int(delta),
+		IdempotencyKey: idempotencyKey,
 	}
 
 	stat, err := actionStat(ctx, c.client, counterBaseKey, interactionStatCounterShardKeys(videoID), jsonKey, videoID, initialStat)
@@ -623,16 +651,6 @@ func actionStatBaseInit(videoID int64, initialStat *domaininteraction.VideoStat)
 		return initialStat
 	}
 	return &domaininteraction.VideoStat{VideoID: videoID}
-}
-
-func queueActionStatBaseInit(ctx context.Context, pipe redis.Pipeliner, counterBaseKey string, initialStat *domaininteraction.VideoStat) {
-	stat := &domaininteraction.VideoStat{}
-	if initialStat != nil {
-		stat = initialStat
-	}
-	pipe.HSetNX(ctx, counterBaseKey, "like_count", stat.LikeCount)
-	pipe.HSetNX(ctx, counterBaseKey, "comment_count", stat.CommentCount)
-	pipe.HSetNX(ctx, counterBaseKey, "favorite_count", stat.FavoriteCount)
 }
 
 func setActionStatJSON(ctx context.Context, client redisActionStatWriter, jsonKey string, stat *domainfeed.FeedStat) error {

@@ -34,7 +34,7 @@
 
 2. 当前系统的性能瓶颈可能出现在 API、MySQL、Redis、RabbitMQ 哪一层？你怎么判断？
 
-   答：判断顺序看指标：API 看 HTTP P95 和 5xx，MySQL 看慢查询和连接池，Redis 看缓存命中率和命令耗时，RabbitMQ 看队列积压和 Worker 成功率。Feed 读慢通常先看页缓存、卡片缓存和计数缓存命中率，再看批量回源 SQL。互动链路慢则看 Redis `WATCH` 更新、RabbitMQ 投递和 Worker 消费耗时。
+   答：判断顺序看指标：API 看 HTTP P95 和 5xx，MySQL 看慢查询和连接池，Redis 看缓存命中率和命令耗时，RabbitMQ 看队列积压和 Worker 成功率。Feed 读慢通常先看页缓存、卡片缓存和计数缓存命中率，再看批量回源 SQL。互动链路慢则看 Redis Lua 脚本更新耗时、RabbitMQ 投递和 Worker 消费耗时。
 
 3. 如果访问量扩大 10 倍，你会先优化哪条链路？
 
@@ -368,9 +368,9 @@
 
    答：Redis action key 保存当前 status 和 idempotency_key。相同幂等键重复请求时，`SetActionState` 复用已存状态并让 delta 为 0。Worker 落库时也应依赖唯一键或幂等键，让重复事件收敛为一次计数变化。
 
-2. Redis `WATCH` 在点赞状态更新里解决什么并发问题？
+2. 点赞状态更新的并发问题怎么解决？为什么用 Lua 脚本？
 
-   答：`WATCH` 监控用户-视频-行为 key，在事务里读取旧状态、计算 delta、写新状态和分片计数。并发点赞或取消时，Redis 会保证事务在 key 状态一致的前提下提交。这样可以降低同一用户重复操作造成的计数偏差。
+   答：`SetActionState` 把"读状态 → 算 delta → 写状态与计数"收进一个 Lua 脚本，一次 EVAL 在 Redis 内部原子执行，天然没有竞态窗口，一次往返、无需重试。之前是 WATCH + MULTI 乐观锁：MULTI 只保证排队命令原子执行，但读发生在 MULTI 之前，并发下可能读到旧状态；WATCH 补这段间隙，但冲突时 go-redis 会自动重试整个回调，重试 = 额外 2-3 次往返。演进史：WATCH → Lua（用 Lua 的缺点要主动说：脚本内所有 key 必须同一哈希槽，Redis Cluster 下 CROSSSLOT 不可用，单机 Redis 成立；脚本执行期间阻塞主线程，必须保持轻量；Lua 写死在 Go 字符串里调试难，靠真 Redis gated 集成测试兜底）。
 
 3. 计数为什么要做分片 key？
 

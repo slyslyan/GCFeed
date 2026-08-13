@@ -164,7 +164,7 @@ TTL 策略：分钟桶 2 小时（防止窗口滑动时历史桶丢失），合�
 ```
 HTTP Handler（~2ms）
   → Interaction Service.SetAction
-  → Redis WATCH + TxPipelined: 更新 action state + shard counter（~1ms）
+  → Redis Lua 脚本（EVAL）: 更新 action state + shard counter（~1ms）
   → RabbitMQ Publish ActionChangedEvent
   → 返回 200（总耗时 < 5ms）
   
@@ -180,14 +180,11 @@ HTTP Handler（~2ms）
 
 **Q2: Redis 怎么保证并发点赞/取消的原子性？**
 
-答：使用 Redis WATCH + TxPipelined（乐观锁）实现 CAS（Compare-And-Swap）：
+答：使用 Lua 脚本（一次 `EVAL`）把"读状态 → 算 delta → 写状态与计数"三步在 Redis 内部原子执行——脚本执行期间没有其他命令插入，天然没有竞态窗口，一次往返、无需重试。`EVALSHA` 缓存脚本体，重复请求只多一次哈希计算。
 
-1. `WATCH interaction:action:v1:{userID}:{videoID}:{type}` 监视当前状态
-2. `GET` 读取当前状态（active/canceled）
-3. 如果状态未变化 → `MULTI` + `SET` 新状态 + `ZINCRBY` 热榜分数 + `EXEC`
-4. 如果 WATCH 期间 key 被其他请求修改 → `EXEC` 失败，重试
+演进史（被追问要讲）：之前是 `WATCH + TxPipelined` 乐观锁——`WATCH` 监视 action key，`MULTI` 里重写状态 + `HINCRBY` 分片计数；WATCH 期间 key 被改 → `EXEC` 失败 → go-redis 自动重试整个回调（重读、重算、重提交）。乐观锁假设冲突概率低（同一用户对同一视频的并发操作极少），冲突时重试即可，但重试 = 额外 2-3 次往返。换成 Lua 后没有重试路径。
 
-这是乐观锁模式——假设冲突概率低（同一用户对同一视频的并发操作极少），不做悲观锁。冲突时重试一次即可，性能远优于分布式锁。
+Lua 的缺点（必须主动说）：脚本内所有 key 必须落在同一哈希槽，Redis Cluster 下 CROSSSLOT 不可用——单机 Redis 成立，集群化要重新设计 key 布局；脚本执行期间阻塞 Redis 主线程，必须保持轻量；脚本写在 Go 字符串里调试难，靠真 Redis gated 集成测试兜底。
 
 **Q3: 计数为什么用 16 个 shard？**
 
@@ -199,7 +196,7 @@ HTTP Handler（~2ms）
 
 答：多层幂等保护：
 
-- **Redis 层**：WATCH + 状态检查——如果当前已是 LIKE 状态，再次 LIKE 直接返回成功（幂等）。
+- **Redis 层**：Lua 脚本内状态检查——如果当前已是 LIKE 状态，再次 LIKE delta=0 直接返回成功（幂等）。
 - **MySQL 层**：`interaction_action` 表有唯一约束 `uk_user_video_type (user_id, video_id, action_type)`，同一操作重复 INSERT 会触发唯一键冲突。
 - **业务层**：所有写接口支持 `Idempotency-Key` 头（最长 128 字符），Worker 消费时检查 `user_id + idempotency_key` 是否已存在，重复事件直接 ACK 丢弃。
 
@@ -335,7 +332,7 @@ result, err, _ := sg.Do(cacheKey, func() (interface{}, error) {
 
 **Q6: Redis 不可用时怎么降级？**
 
-答：当前降级策略：读路径中的缓存 miss → 直接回源 MySQL（singleflight 保护）；写路径中的 Redis WATCH 操作 → 返回错误，由客户端重试。更完善的降级方案（后续演进）：写路径也支持 MySQL 直写模式（跳过 Redis，接口延迟升高但功能不受影响），通过配置开关或自动探测 Redis 存活状态切换。
+答：当前降级策略：读路径中的缓存 miss → 直接回源 MySQL（singleflight 保护）；写路径中的 Redis Lua 脚本操作 → 返回错误，由客户端重试。更完善的降级方案（后续演进）：写路径也支持 MySQL 直写模式（跳过 Redis，接口延迟升高但功能不受影响），通过配置开关或自动探测 Redis 存活状态切换。
 
 
 **Q8: DDD 四层架构对稳定性有什么帮助？**
