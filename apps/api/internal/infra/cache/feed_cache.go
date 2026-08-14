@@ -8,6 +8,8 @@ import (
 	inframetrics "GCFeed/internal/infra/metrics"
 	"container/heap"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -67,7 +69,9 @@ end
 redis.call('HSET', KEYS[1], 'status', effectiveStatus, 'idempotency_key', idempotencyKey, 'updated_at', ARGV[4])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
 
-if redis.call('HEXISTS', KEYS[2], 'like_count') == 0 then
+-- needInit 须在写计数前捕获,epoch 只随冷启动(base 全新建)落库
+local needInit = redis.call('HEXISTS', KEYS[2], 'like_count') == 0
+if needInit then
 	redis.call('HSET', KEYS[2], 'like_count', ARGV[6])
 end
 if redis.call('HEXISTS', KEYS[2], 'comment_count') == 0 then
@@ -77,6 +81,22 @@ if redis.call('HEXISTS', KEYS[2], 'favorite_count') == 0 then
 	redis.call('HSET', KEYS[2], 'favorite_count', ARGV[8])
 end
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[9]))
+
+-- 版本号:冷启动写新 epoch;存量无版本数据沿用空串与旧 shard 匹配,base 重建时才切换
+local baseEpoch = redis.call('HGET', KEYS[2], 'epoch')
+if baseEpoch == false then
+	if needInit then
+		baseEpoch = ARGV[11]
+		redis.call('HSET', KEYS[2], 'epoch', baseEpoch)
+	else
+		baseEpoch = ''
+	end
+end
+-- 残留旧版 shard(base 重建前的增量)清零并绑定当前版本,杜绝重建后双计
+local shardEpoch = redis.call('HGET', KEYS[3], 'epoch')
+if shardEpoch == false or shardEpoch ~= baseEpoch then
+	redis.call('HSET', KEYS[3], 'like_count', '0', 'favorite_count', '0', 'epoch', baseEpoch)
+end
 
 if delta ~= 0 then
 	redis.call('HINCRBY', KEYS[3], ARGV[10], delta)
@@ -543,6 +563,7 @@ func (c *FeedCache) SetActionState(ctx context.Context, userID int64, videoID in
 		baseStat.FavoriteCount,
 		int64(actionStatTTL/time.Second),
 		interactionStatField(actionType),
+		newInteractionStatEpoch(),
 	).Result()
 	if err != nil {
 		return nil, err
@@ -593,33 +614,19 @@ func actionStatFromCache(ctx context.Context, client redisActionStatReader, vide
 
 func actionStatWithPresence(ctx context.Context, client redisActionStatReader, counterBaseKey string, counterShardKeys []string, jsonKey string, videoID int64, initialStat *domaininteraction.VideoStat) (*domainfeed.FeedStat, bool, error) {
 	stat := &domainfeed.FeedStat{VideoID: videoID}
-	found := false
 	values, err := client.HGetAll(ctx, counterBaseKey).Result()
 	if err != nil {
 		return nil, false, err
 	}
 	if len(values) > 0 {
 		applyActionStatFields(stat, values)
-		found = true
-	} else {
-		fallbackStat, ok, err := actionStatFallback(ctx, client, jsonKey, videoID, initialStat)
-		if err != nil {
+		if err := applyActionStatShardDeltas(ctx, client, stat, counterShardKeys, values["epoch"]); err != nil {
 			return nil, false, err
 		}
-		if ok {
-			stat = fallbackStat
-			found = true
-		}
+		return stat, true, nil
 	}
-	shardFound, err := applyActionStatShardDeltas(ctx, client, stat, counterShardKeys)
-	if err != nil {
-		return nil, false, err
-	}
-	found = found || shardFound
-	if !found {
-		return nil, false, nil
-	}
-	return stat, true, nil
+	// base 缺失时基线只来自 JSON/DB 快照:残留 shard 无法校验版本,叠加会双计。
+	return actionStatFallback(ctx, client, jsonKey, videoID, initialStat)
 }
 
 func actionStatFallback(ctx context.Context, client redisActionStatReader, jsonKey string, videoID int64, initialStat *domaininteraction.VideoStat) (*domainfeed.FeedStat, bool, error) {
@@ -661,28 +668,31 @@ func setActionStatJSON(ctx context.Context, client redisActionStatWriter, jsonKe
 	return client.Set(ctx, jsonKey, content, actionStatJSONTTL).Err()
 }
 
-func applyActionStatShardDeltas(ctx context.Context, client redisActionStatReader, stat *domainfeed.FeedStat, shardKeys []string) (bool, error) {
+func applyActionStatShardDeltas(ctx context.Context, client redisActionStatReader, stat *domainfeed.FeedStat, shardKeys []string, baseEpoch string) error {
 	if stat == nil || len(shardKeys) == 0 {
-		return false, nil
+		return nil
 	}
 
 	shardValues, err := loadActionStatShardValues(ctx, client, shardKeys)
 	if err != nil {
-		return false, err
+		return err
 	}
-	found := false
 	likeDelta := 0
 	favoriteDelta := 0
 	for _, values := range shardValues {
-		if len(values) > 0 {
-			found = true
+		if len(values) == 0 {
+			continue
+		}
+		// 版本不匹配的残留 shard(base 重建前的增量)不叠加。
+		if values["epoch"] != baseEpoch {
+			continue
 		}
 		likeDelta += actionStatFieldInt(values, "like_count")
 		favoriteDelta += actionStatFieldInt(values, "favorite_count")
 	}
 	stat.LikeCount = clampRedisCount(stat.LikeCount + likeDelta)
 	stat.FavoriteCount = clampRedisCount(stat.FavoriteCount + favoriteDelta)
-	return found, nil
+	return nil
 }
 
 func loadActionStatShardValues(ctx context.Context, client redisActionStatReader, shardKeys []string) ([]map[string]string, error) {
@@ -880,6 +890,15 @@ func mergeFollowingIndexes(streams [][]string, authorIDs []int64, limit int) []*
 		items = append(items, entry.item)
 	}
 	return items
+}
+
+// newInteractionStatEpoch 生成 base 计数的版本号;base 重建时更换版本,旧版 shard 自动失效。
+func newInteractionStatEpoch() string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err == nil {
+		return hex.EncodeToString(buf)
+	}
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
 func interactionActionKey(userID int64, videoID int64, actionType string) string {
