@@ -130,6 +130,8 @@ apps/api/internal/interfaces/http/interaction/
 
 点赞和收藏启用 Redis 快速状态后，接口先校验视频状态和幂等键，再写入 Redis 行为状态与实时计数，随后投递 `ActionChangedEvent` 到 RabbitMQ。Worker 消费事件并调用仓储写入 MySQL 行为表和 `video_stat`，消费端依赖 `user_id + video_id + action_type` 与幂等键保持重复消息安全。
 
+**消息顺序问题**: 单消费者 FIFO 正常有序，但消息处理失败 Nack 重入队时可能乱序。例如点赞后立即取消，取消消息先到 → 创建 canceled 记录，点赞消息后到 → 改为 active、delta=+1，DB 计数永久错 1。Worker 消费前根据 `OccurredAt` 时间戳比对 DB 记录 `updated_at`，仅在事件时间晚于记录时间时放行，否则丢弃。查询失败时降级放行，由 `SetAction` 行锁和幂等兜底。详见 `application/interaction/worker.go` `HandleActionChanged`。
+
 核心键和队列：
 
 | 类型 | 名称 |

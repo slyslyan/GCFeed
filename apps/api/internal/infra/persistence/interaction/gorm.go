@@ -187,6 +187,24 @@ func (r *Repository) SetAction(ctx context.Context, userID int64, videoID int64,
 	return restoreAction(action), count, statDelta, nil
 }
 
+// GetLastActionUpdateTime 读取用户对某视频某行为类型的最后更新时间。
+// 记录不存在时返回零值，不会阻塞事件处理（零值 < 任何 OccurredAt，放行）。
+func (r *Repository) GetLastActionUpdateTime(ctx context.Context, userID int64, videoID int64, actionType string) (time.Time, error) {
+	var model ActionModel
+	err := r.db.WithContext(ctx).
+		Select("updated_at").
+		Where("user_id = ? AND video_id = ? AND action_type = ?", userID, videoID, actionType).
+		Take(&model).
+		Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	return model.UpdatedAt, nil
+}
+
 // actionStatusFromActive 将接口目标状态转换为数据库状态枚举。
 func actionStatusFromActive(active bool) int {
 	if active {

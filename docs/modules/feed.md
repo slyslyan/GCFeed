@@ -150,3 +150,5 @@ feed:hot:window:v1:{windowEndUnix}
 ```
 
 读取热榜时，Feed Service 合并窗口结束分钟前 60 个分钟桶，移除汇总分小于等于 0 的条目，再按分数倒序读取当前页。分钟桶 TTL 为 2 小时，窗口临时 key TTL 为 2 分钟。
+
+> 拓展规划：热度榜重构（时间衰减 + 观看权重 + 冷启动探索 + 异步写入 + 双体系统一）方案见 [openspec/changes/hot-ranking-refactor/proposal.md](../../openspec/changes/hot-ranking-refactor/proposal.md)，暂未实施。

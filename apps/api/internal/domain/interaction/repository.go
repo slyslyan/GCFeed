@@ -1,6 +1,7 @@
 package domaininteraction
 
 import "context"
+import "time"
 
 // Repository 定义互动领域需要的持久化能力。
 type Repository interface {
@@ -12,6 +13,9 @@ type Repository interface {
 	GetUserProfile(ctx context.Context, userID int64) (*UserProfile, error)
 	// SetAction 设置点赞或收藏状态，并返回最新统计值。
 	SetAction(ctx context.Context, userID int64, videoID int64, actionType string, active bool, idempotencyKey string) (*Action, int, int, error)
+	// GetLastActionUpdateTime 读取用户对某视频某行为类型的最后更新时间，用于 MQ 消费端丢弃过期事件。
+	// 记录不存在时返回 zero time 和 nil error。
+	GetLastActionUpdateTime(ctx context.Context, userID int64, videoID int64, actionType string) (time.Time, error)
 	// CreateComment 创建评论并返回视频最新评论数。
 	CreateComment(ctx context.Context, comment *Comment) (*Comment, int, int, error)
 	// FindCommentByUserAndIdempotencyKey 用于评论创建接口的幂等重放。

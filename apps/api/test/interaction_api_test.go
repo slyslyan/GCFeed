@@ -242,6 +242,17 @@ func (r *memoryInteractionRepo) SetAction(ctx context.Context, userID int64, vid
 	return cloneInteractionAction(action), r.actionCount(videoID, actionType), delta, nil
 }
 
+func (r *memoryInteractionRepo) GetLastActionUpdateTime(ctx context.Context, userID int64, videoID int64, actionType string) (time.Time, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := memoryInteractionActionKey(userID, videoID, actionType)
+	action, exists := r.actions[key]
+	if !exists {
+		return time.Time{}, nil
+	}
+	return action.UpdatedAt, nil
+}
+
 // CreateComment 模拟评论创建，并维护视频评论数和评论幂等索引。
 func (r *memoryInteractionRepo) CreateComment(ctx context.Context, comment *domaininteraction.Comment) (*domaininteraction.Comment, int, int, error) {
 	r.mu.Lock()
