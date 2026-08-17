@@ -309,7 +309,7 @@ func (s *Service) setActionAsync(ctx context.Context, userID int64, videoID int6
 
 	state, err := s.actionStateStore.SetActionState(ctx, userID, videoID, actionType, active, idempotencyKey, initialStat)
 	if err != nil {
-		return nil, ErrUpdateInteractionFailed
+		return s.setActionSync(ctx, userID, videoID, actionType, active, idempotencyKey)
 	}
 
 	if state.Delta != 0 {
