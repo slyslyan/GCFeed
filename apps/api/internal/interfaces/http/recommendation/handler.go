@@ -147,6 +147,11 @@ func exposureDecisionsResponseFromResult(result *applicationrecommendation.Expos
 }
 
 func writeRecommendationError(c *gin.Context, err error) {
+	if errors.Is(err, domainrecommendation.ErrModelUnavailable) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "recommendation model unavailable"})
+		return
+	}
+
 	if isBadRequestError(err) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

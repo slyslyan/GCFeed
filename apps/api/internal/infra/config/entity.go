@@ -2,14 +2,15 @@ package infraconfig
 
 // Config 是应用启动配置的根结构，对应 configs/config.yaml。
 type Config struct {
-	Port     int            `yaml:"port"`
-	JWT      JWTConfig      `yaml:"jwt"`
-	Cookie   CookieConfig   `yaml:"cookie"`
-	Internal InternalConfig `yaml:"internal"`
-	Database DatabaseConfig `yaml:"database"`
-	Redis    RedisConfig    `yaml:"redis"`
-	RabbitMQ RabbitMQConfig `yaml:"rabbitmq"`
-	Milvus   MilvusConfig   `yaml:"milvus"`
+	RecommendationModel string         `yaml:"recommendation_model"`
+	Port                int            `yaml:"port"`
+	JWT                 JWTConfig      `yaml:"jwt"`
+	Cookie              CookieConfig   `yaml:"cookie"`
+	Internal            InternalConfig `yaml:"internal"`
+	Database            DatabaseConfig `yaml:"database"`
+	Redis               RedisConfig    `yaml:"redis"`
+	RabbitMQ            RabbitMQConfig `yaml:"rabbitmq"`
+	Milvus              MilvusConfig   `yaml:"milvus"`
 }
 
 // JWTConfig 保存 JWT 签名密钥和 access/refresh token 有效期。
@@ -46,7 +47,7 @@ type RedisConfig struct {
 	DB       int    `yaml:"db"`
 }
 
-// MilvusConfig 保存 Milvus 向量库连接参数，为空时向量召回路自动降级。
+// MilvusConfig 保存 Milvus 向量库连接参数，留空时使用同一份模型在本机精确检索。
 type MilvusConfig struct {
 	Address string `yaml:"address"`
 }

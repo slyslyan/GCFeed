@@ -11,7 +11,6 @@ import (
 	applicationrelation "GCFeed/internal/application/relation"
 	applicationvideo "GCFeed/internal/application/video"
 	domainfeed "GCFeed/internal/domain/feed"
-	domainrecommendation "GCFeed/internal/domain/recommendation"
 	infracache "GCFeed/internal/infra/cache"
 	infraconfig "GCFeed/internal/infra/config"
 	infrajwt "GCFeed/internal/infra/jwt"
@@ -28,7 +27,7 @@ import (
 	infrasession "GCFeed/internal/infra/persistence/session"
 	infravideo "GCFeed/internal/infra/persistence/video"
 	infrarefreshtoken "GCFeed/internal/infra/refreshtoken"
-	infravector "GCFeed/internal/infra/vector"
+	infratwotower "GCFeed/internal/infra/twotower"
 	interfaceshttpaccount "GCFeed/internal/interfaces/http/account"
 	interfaceshttpexposure "GCFeed/internal/interfaces/http/exposure"
 	interfaceshttpfeed "GCFeed/internal/interfaces/http/feed"
@@ -43,7 +42,6 @@ import (
 	"context"
 	"database/sql"
 	"log"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -84,20 +82,18 @@ func Register(g *gin.Engine, cfg *infraconfig.Config, db *sql.DB) error {
 	videoRepo := infravideo.New(gormDB)
 	feedRepo := infrafeed.New(gormDB)
 	recommendationRepo := infrarecommendation.New(gormDB)
-	// Milvus 未就绪不阻塞启动：LazyStore 后台重试连接 + 建集合，就绪前向量路自动降级。
-	var vectorStore infravector.VectorStore
-	if cfg.Milvus.Address != "" {
-		vectorStore = infravector.NewLazyStore(context.Background(), cfg.Milvus.Address, 5*time.Second)
+	modelPath := cfg.RecommendationModel
+	if modelPath == "" {
+		modelPath = "./models/twotower.json"
 	}
-	recommendationService := applicationrecommendation.New(
-		recommendationRepo,
-		applicationrecommendation.WithRecallerSet([]domainrecommendation.Recaller{
-			infrarecommendation.NewHotRecaller(gormDB),
-			infrarecommendation.NewFollowingRecaller(gormDB),
-			infrarecommendation.NewVectorRecaller(gormDB, vectorStore),
-		}),
-		applicationrecommendation.WithFollowingBoost(0.05),
-	)
+	var options []applicationrecommendation.Option
+	recaller, err := infratwotower.Open(context.Background(), modelPath, cfg.Milvus.Address, recommendationRepo)
+	if err != nil {
+		log.Printf("recommendation unavailable: %v", err)
+	} else {
+		options = append(options, applicationrecommendation.WithRecaller(recaller))
+	}
+	recommendationService := applicationrecommendation.New(recommendationRepo, options...)
 	recommendationHandler := interfaceshttprecommendation.New(recommendationService)
 	feedOptions := []applicationfeed.Option{applicationfeed.WithRecommender(recommendationService)}
 	videoOptions := []applicationvideo.Option{}

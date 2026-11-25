@@ -335,25 +335,6 @@ func (r *RabbitMQ) ensureTopology() error {
 	); err != nil {
 		return err
 	}
-	if _, err := r.publishChannel.QueueDeclare(
-		r.config.VideoEmbeddingQueue,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-	if err := r.publishChannel.QueueBind(
-		r.config.VideoEmbeddingQueue,
-		r.config.VideoPublishedRouting,
-		r.config.VideoExchange,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
 	if err := r.publishChannel.ExchangeDeclare(
 		r.config.ExposureExchange,
 		"topic",

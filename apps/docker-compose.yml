@@ -99,6 +99,7 @@ services:
     volumes:
       - ./api/configs/config.docker.yaml:/app/configs/config.yaml:ro
       - api_uploads:/app/uploads
+      - ./api/models:/app/models:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health >/dev/null"]
       interval: 10s
@@ -119,8 +120,6 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      milvus:
-        condition: service_started
     volumes:
       - ./api/configs/config.docker.yaml:/app/configs/config.yaml:ro
 

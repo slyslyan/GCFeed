@@ -74,6 +74,16 @@ func (r *memoryExposureRepo) SaveViewEvent(ctx context.Context, event *domainexp
 	if !r.published[event.VideoID] {
 		return nil, nil, domainexposure.ErrVideoNotFound
 	}
+	if event.RequestID != "" {
+		for _, existing := range r.events {
+			if existing.UserID == event.UserID && existing.VideoID == event.VideoID && existing.Scene == event.Scene && existing.RequestID == event.RequestID && existing.EventType == event.EventType {
+				if event.CountsAsExposure() {
+					return cloneExposureViewEvent(existing), cloneExposure(r.exposures[memoryExposureKey(event.UserID, event.VideoID)]), nil
+				}
+				return cloneExposureViewEvent(existing), nil, nil
+			}
+		}
+	}
 
 	now := time.Now()
 	saved := cloneExposureViewEvent(event)
@@ -232,6 +242,67 @@ func TestExposurePublishesViewEvent(t *testing.T) {
 	requireStatus(t, missingVideoResponse, http.StatusNotFound)
 	if len(publisher.Events()) != 1 {
 		t.Fatalf("published event after failed save")
+	}
+}
+
+func TestExposureRetriesReturnOriginalEvent(t *testing.T) {
+	publisher := &memoryViewEventPublisher{}
+	router, jwtManager, repo := newExposureRouterWithPublisher(t, publisher)
+	token := signTestToken(t, jwtManager, 42)
+	for _, eventType := range []string{"exposed", "play", "complete"} {
+		var original exposureAPIResponse
+		for attempt := 0; attempt < 2; attempt++ {
+			body := fmt.Sprintf(`{"video_id":1001,"scene":"recommend","request_id":"same-request","event_type":%q,"watch_ms":%d}`, eventType, 3000+attempt*1000)
+			response := performJSONRequest(router, http.MethodPost, "/api/video-view-events", body, token)
+			requireStatus(t, response, http.StatusCreated)
+			var result exposureAPIResponse
+			decodeJSON(t, response, &result)
+			if attempt == 0 {
+				original = result
+			} else if result.Event.ID != original.Event.ID || result.Event.WatchMs != original.Event.WatchMs || !result.Event.CreatedAt.Equal(original.Event.CreatedAt) {
+				t.Fatalf("retry changed the stored %s event: first=%+v retry=%+v", eventType, original.Event, result.Event)
+			}
+			if result.Exposure != nil && result.Exposure.ExposureCount != 1 {
+				t.Fatalf("retry inflated exposure count: %+v", result.Exposure)
+			}
+		}
+	}
+	if repo.EventCount() != 3 {
+		t.Fatalf("retries created duplicate training samples: %d", repo.EventCount())
+	}
+	events := publisher.Events()
+	if len(events) != 6 {
+		t.Fatalf("unexpected retry publication count: %d", len(events))
+	}
+	for i := 0; i < len(events); i += 2 {
+		if events[i].EventID != events[i+1].EventID || events[i].ViewEventID != events[i+1].ViewEventID {
+			t.Fatalf("retry changed the published event identity: %+v %+v", events[i], events[i+1])
+		}
+	}
+}
+
+func TestExposureDistinctRequestsRemainIndependent(t *testing.T) {
+	repo := newMemoryExposureRepo()
+	service := applicationexposure.New(repo)
+	requests := []struct {
+		userID, videoID int64
+		scene, request  string
+	}{
+		{42, 1001, "recommend", "request-1"},
+		{42, 1001, "recommend", "request-2"},
+		{43, 1001, "recommend", "request-1"},
+		{42, 1002, "recommend", "request-1"},
+		{42, 1001, "timeline", "request-1"},
+		{42, 1001, "recommend", ""},
+		{42, 1001, "recommend", ""},
+	}
+	for _, req := range requests {
+		if _, err := service.RecordViewEvent(context.Background(), req.userID, req.videoID, req.scene, req.request, "play", 3000, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if repo.EventCount() != len(requests) {
+		t.Fatalf("independent viewing requests were merged: %d", repo.EventCount())
 	}
 }
 

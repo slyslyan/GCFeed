@@ -29,7 +29,7 @@ func NewViewEventRecordedEvent(event *domainexposure.ViewEvent, exposure *domain
 		return nil
 	}
 	message := &ViewEventRecordedEvent{
-		EventID:     newEventID(),
+		EventID:     fmt.Sprintf("view-event-%d", event.ID),
 		ViewEventID: event.ID,
 		UserID:      event.UserID,
 		VideoID:     event.VideoID,
@@ -40,6 +40,9 @@ func NewViewEventRecordedEvent(event *domainexposure.ViewEvent, exposure *domain
 		Completed:   event.Completed,
 		RecordedAt:  event.CreatedAt.UTC(),
 		OccurredAt:  time.Now().UTC(),
+	}
+	if event.ID == 0 {
+		message.EventID = newEventID()
 	}
 	if exposure != nil {
 		message.ExposureCount = exposure.ExposureCount

@@ -975,24 +975,15 @@ function FeedPage({ feedScene, session, onNavigate }) {
     const exposureKey = `${scene}:${requestID}:${current.video_id}`;
     if (!requestID || exposedRef.current.has(exposureKey)) return;
     exposedRef.current.add(exposureKey);
-    apiRequest("/api/video-view-events", {
-      method: "POST",
-      token: session.token,
-      body: {
-        video_id: current.video_id,
-        scene,
-        request_id: requestID,
-        event_type: "exposed",
-        watch_ms: 0,
-        completed: false
-      }
-    }).catch((error) => {
-      if (error.status === 401 && requiresAuthFeed(feedScene)) {
-        session.clearAuth();
-        onNavigate("/auth");
-      }
-    });
-  }, [current, feedRequestID, feedScene, feedState, onNavigate, session]);
+    sendViewEventReport({
+      video_id: current.video_id,
+      scene,
+      request_id: requestID,
+      event_type: "exposed",
+      watch_ms: 0,
+      completed: false
+    }, session.token).catch(() => exposedRef.current.delete(exposureKey));
+  }, [current, feedRequestID, feedScene, feedState, session.token]);
 
   useEffect(() => {
     if (!current || feedState !== "ready" || !session.token) return undefined;
@@ -1012,6 +1003,16 @@ function FeedPage({ feedScene, session, onNavigate }) {
       live = false;
     };
   }, [current?.video_id, feedScene, feedState, onNavigate, playbackConfig.preload_count, session.clearAuth, session.token]);
+
+  const reportViewEvent = useCallback((item, event) => {
+    if (!session.token || !item?.request_id) return;
+    sendViewEventReport({
+      video_id: item.video_id,
+      scene: item.feed_scene,
+      request_id: item.request_id,
+      ...event
+    }, session.token).catch(() => {});
+  }, [session.token]);
 
   const reportPlaybackQoS = useCallback(
     (item, metrics) => {
@@ -1388,6 +1389,8 @@ function FeedPage({ feedScene, session, onNavigate }) {
                     onFavorite={setFavorite}
                     onFollow={setFollow}
                     onPlaybackQoS={reportPlaybackQoS}
+                    onViewEvent={reportViewEvent}
+                    viewerID={session.user?.id || 0}
                     onOpenAuthor={(author) => openPublicProfile(author, onNavigate)}
                     followError={followError}
                   />
@@ -1407,6 +1410,8 @@ function FeedPage({ feedScene, session, onNavigate }) {
                   onFavorite={setFavorite}
                   onFollow={setFollow}
                   onPlaybackQoS={reportPlaybackQoS}
+                  onViewEvent={reportViewEvent}
+                  viewerID={session.user?.id || 0}
                   onOpenAuthor={(author) => openPublicProfile(author, onNavigate)}
                   followError={followError}
                 />
@@ -1426,6 +1431,8 @@ function FeedPage({ feedScene, session, onNavigate }) {
                     onFavorite={setFavorite}
                     onFollow={setFollow}
                     onPlaybackQoS={reportPlaybackQoS}
+                    onViewEvent={reportViewEvent}
+                    viewerID={session.user?.id || 0}
                     onOpenAuthor={(author) => openPublicProfile(author, onNavigate)}
                     followError={followError}
                   />
@@ -1482,6 +1489,8 @@ function VideoStage({
   onFavorite,
   onFollow,
   onPlaybackQoS,
+  onViewEvent,
+  viewerID,
   onOpenAuthor
 }) {
   const cover = item.cover_url || image.stage;
@@ -1490,6 +1499,52 @@ function VideoStage({
   const videoRef = useRef(null);
   const itemRef = useRef(item);
   const qosRef = useRef(createVideoQoSState(item.video_id));
+  const activeRef = useRef(active);
+  activeRef.current = active;
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !showVideo) return undefined;
+    // 回调与本次观看者一起捕获，换账号时重新建状态，旧视频时长不交给新账号。
+    const state = createVideoViewState(item);
+    let playing = !video.paused && video.readyState >= 3;
+    const sample = (eligible = playing && activeRef.current && !document.hidden) => {
+      const events = sampleVideoViewState(state, video.currentTime, video.duration, performance.now(), eligible, video.playbackRate);
+      for (const event of events) onViewEvent?.(state.item, event);
+    };
+    const start = () => {
+      sample(false);
+      playing = true;
+      sample();
+    };
+    const stop = () => {
+      sample();
+      playing = false;
+      sample(false);
+    };
+    const seek = () => {
+      playing = false;
+      sample(false);
+    };
+    const resume = () => {
+      sample(false);
+      playing = !video.paused && video.readyState >= 3;
+      sample();
+    };
+    const progress = () => sample();
+    const listeners = { playing: start, timeupdate: progress, pause: stop, waiting: stop, seeking: seek, seeked: resume, ended: stop };
+    for (const [type, listener] of Object.entries(listeners)) video.addEventListener(type, listener);
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("pagehide", progress);
+    sample();
+    return () => {
+      // video 是本次观看绑定的元素；切换 src 后不会读取下一条视频的时间。
+      sample();
+      for (const [type, listener] of Object.entries(listeners)) video.removeEventListener(type, listener);
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("pagehide", progress);
+    };
+  }, [item.video_id, item.request_id, item.feed_scene, media, showVideo, viewerID]);
 
   useEffect(() => {
     itemRef.current = item;
@@ -1565,6 +1620,7 @@ function VideoStage({
       <div className="stage-vignette" />
       {showVideo ? (
         <video
+          key={`${item.video_id}:${item.request_id || ""}`}
           ref={videoRef}
           className="stage-media"
           src={media}
@@ -2847,6 +2903,56 @@ function prewarmVideoMetadata(url, loadedSet) {
   probe.load();
 }
 
+function createVideoViewState(item) {
+  return {
+    item: { video_id: item.video_id, feed_scene: item.feed_scene, request_id: item.request_id },
+    position: null,
+    sampledAt: 0,
+    eligible: false,
+    watchMs: 0,
+    ranges: [],
+    playReported: false,
+    completeReported: false
+  };
+}
+
+function sampleVideoViewState(state, position, duration, now, eligible, playbackRate = 1) {
+  const previous = state.position;
+  const elapsed = (now - state.sampledAt) / 1000;
+  const wasEligible = state.eligible;
+  state.position = position;
+  state.sampledAt = now;
+  state.eligible = eligible;
+  if (!eligible || !wasEligible || previous === null || !Number.isFinite(position) || position < 0 || elapsed <= 0 || playbackRate <= 0) return [];
+
+  const looped = position < previous;
+  const distance = looped ? duration - previous + position : position - previous;
+  // seeking 事件会重置采样；额外拒绝无法由实际播放时间解释的跳跃。
+  if (!Number.isFinite(distance) || distance <= 0 || distance > elapsed * playbackRate + 0.25) return [];
+  state.watchMs += Math.min(elapsed, distance / playbackRate) * 1000;
+  const ranges = looped ? [[previous, duration], [0, position]] : [[previous, position]];
+  const merged = [];
+  for (const range of [...state.ranges, ...ranges].sort((a, b) => a[0] - b[0])) {
+    const last = merged[merged.length - 1];
+    if (last && range[0] <= last[1]) last[1] = Math.max(last[1], range[1]);
+    else merged.push([...range]);
+  }
+  state.ranges = merged;
+  const covered = merged.reduce((sum, range) => sum + range[1] - range[0], 0);
+  const completed = Number.isFinite(duration) && duration > 0 && covered >= duration * 0.95;
+  const events = [];
+  // 正向播放信号要求累计有效观看 3 秒；短视频真实完播也可形成正反馈。
+  if (!state.playReported && (Math.round(state.watchMs) >= 3000 || completed)) {
+    state.playReported = true;
+    events.push({ event_type: "play", watch_ms: Math.round(state.watchMs), completed: false });
+  }
+  if (!state.completeReported && completed) {
+    state.completeReported = true;
+    events.push({ event_type: "complete", watch_ms: Math.round(state.watchMs), completed: true });
+  }
+  return events;
+}
+
 function createVideoQoSState(videoID) {
   return {
     videoID,
@@ -3025,6 +3131,28 @@ async function tryRefreshSession() {
   return refreshPromise;
 }
 
+async function sendViewEventReport(body, token) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await apiRequest("/api/video-view-events", { method: "POST", token, body, keepalive: true });
+    } catch (error) {
+      if (attempt >= 1 || error.status && error.status < 500) throw error;
+      // 使用同一 request_id 和事件类型重试，服务端唯一键避免重复训练样本。
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    }
+  }
+}
+
+function accessTokenUserID(token) {
+  try {
+    const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const userID = Number(JSON.parse(atob(payload)).uid);
+    return Number.isSafeInteger(userID) && userID > 0 ? userID : 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function apiRequest(path, options = {}, retried = false) {
   const headers = {
     Accept: "application/json",
@@ -3036,7 +3164,8 @@ async function apiRequest(path, options = {}, retried = false) {
   const response = await fetch(path, {
     method: options.method || "GET",
     headers,
-    body: options.body ? JSON.stringify(options.body) : undefined
+    body: options.body ? JSON.stringify(options.body) : undefined,
+    keepalive: options.keepalive
   });
 
   if (!response.ok) {
@@ -3055,6 +3184,8 @@ async function apiRequest(path, options = {}, retried = false) {
     if (response.status === 401 && !retried && !path.startsWith("/api/sessions")) {
       const refreshed = await tryRefreshSession();
       if (refreshed && refreshed.access_token) {
+        // 只比对请求归属；签名和有效性仍由服务端校验。换账号后的 Cookie 不能替旧请求授权。
+        if (options.token && (!accessTokenUserID(options.token) || accessTokenUserID(options.token) !== accessTokenUserID(refreshed.access_token))) throw error;
         if (onAccessTokenRefreshed) onAccessTokenRefreshed(refreshed.access_token);
         return apiRequest(path, { ...options, token: refreshed.access_token }, true);
       }

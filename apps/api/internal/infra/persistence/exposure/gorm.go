@@ -5,7 +5,10 @@ import (
 	domainvideo "GCFeed/internal/domain/video"
 	infravideo "GCFeed/internal/infra/persistence/video"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 
 	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
@@ -35,6 +38,7 @@ func (r *Repository) SaveViewEvent(ctx context.Context, event *domainexposure.Vi
 			Scene:     event.Scene,
 			RequestID: stringPtr(event.RequestID),
 			EventType: event.EventType,
+			DedupKey:  viewEventDedupKey(event),
 			WatchMs:   event.WatchMs,
 			Completed: event.Completed,
 		}
@@ -72,7 +76,18 @@ func (r *Repository) SaveViewEvent(ctx context.Context, event *domainexposure.Vi
 		return tx.Where("user_id = ? AND video_id = ?", event.UserID, event.VideoID).Take(&exposureModel).Error
 	})
 	if err != nil {
-		return nil, nil, mapExposureError(err)
+		if eventModel.DedupKey == nil || !isDuplicateKeyError(err) {
+			return nil, nil, mapExposureError(err)
+		}
+		// 重复插入先回滚，再用新快照读取已提交的赢家；不升级重复键共享锁。
+		if err := r.db.WithContext(ctx).Where("dedup_key = ?", *eventModel.DedupKey).Take(&eventModel).Error; err != nil {
+			return nil, nil, err
+		}
+		if event.CountsAsExposure() {
+			if err := r.db.WithContext(ctx).Where("user_id = ? AND video_id = ?", event.UserID, event.VideoID).Take(&exposureModel).Error; err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 
 	savedEvent := restoreViewEvent(eventModel)
@@ -81,6 +96,16 @@ func (r *Repository) SaveViewEvent(ctx context.Context, event *domainexposure.Vi
 		exposure = restoreExposure(exposureModel)
 	}
 	return savedEvent, exposure, nil
+}
+
+func viewEventDedupKey(event *domainexposure.ViewEvent) *string {
+	if event.RequestID == "" {
+		return nil
+	}
+	content := fmt.Sprintf("%d:%d:%q:%q:%q", event.UserID, event.VideoID, event.Scene, event.RequestID, event.EventType)
+	hash := sha256.Sum256([]byte(content))
+	key := hex.EncodeToString(hash[:])
+	return &key
 }
 
 func ensurePublishedVideo(tx *gorm.DB, videoID int64) error {

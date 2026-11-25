@@ -3,6 +3,7 @@ package infrarecommendation
 import (
 	infravector "GCFeed/internal/infra/vector"
 	"context"
+	"crypto/sha256"
 	"os"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ func newMilvusStoreForTest(t *testing.T) *infravector.MilvusStore {
 	if addr == "" {
 		t.Skip("TEST_MILVUS_ADDR not set, skip Milvus integration test")
 	}
-	store, err := infravector.NewMilvusStore(addr)
+	store, err := infravector.NewSnapshotStore(context.Background(), addr, sha256.Sum256([]byte("gcfeed-integration-test-fixture")))
 	if err != nil {
 		t.Fatalf("connect milvus: %v", err)
 	}

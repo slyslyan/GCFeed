@@ -4,12 +4,14 @@ import "time"
 
 // ViewEventModel 映射 video_view_events 表，保存观看行为流水。
 type ViewEventModel struct {
-	ID        int64     `gorm:"column:id;primaryKey;autoIncrement"`
-	UserID    int64     `gorm:"column:user_id;not null;index:idx_user_created,priority:1"`
-	VideoID   int64     `gorm:"column:video_id;not null;index:idx_video_created,priority:1"`
-	Scene     string    `gorm:"column:scene;size:32;not null;index:idx_user_scene_created,priority:2"`
-	RequestID *string   `gorm:"column:request_id;size:64;index:idx_request_event,priority:1"`
-	EventType string    `gorm:"column:event_type;size:32;not null;index:idx_request_event,priority:2"`
+	ID        int64   `gorm:"column:id;primaryKey;autoIncrement"`
+	UserID    int64   `gorm:"column:user_id;not null;index:idx_user_created,priority:1"`
+	VideoID   int64   `gorm:"column:video_id;not null;index:idx_video_created,priority:1"`
+	Scene     string  `gorm:"column:scene;size:32;not null;index:idx_user_scene_created,priority:2"`
+	RequestID *string `gorm:"column:request_id;size:64;index:idx_request_event,priority:1"`
+	EventType string  `gorm:"column:event_type;size:32;not null;index:idx_request_event,priority:2"`
+	// 旧流水保留 NULL；新请求按用户、视频、场景、request_id 和事件类型去重。
+	DedupKey  *string   `gorm:"column:dedup_key;size:64;uniqueIndex:uk_view_event_dedup"`
 	WatchMs   int       `gorm:"column:watch_ms;not null;default:0"`
 	Completed bool      `gorm:"column:completed;not null;default:false"`
 	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime;index:idx_user_created,priority:2;index:idx_video_created,priority:2;index:idx_user_scene_created,priority:3"`

@@ -37,3 +37,5 @@ rabbitmq:
 
 milvus:
   address: "localhost:19530"
+
+recommendation_model: "./models/twotower.json"

@@ -7,9 +7,11 @@ import (
 )
 
 const MaxLimit = 100
+const MaxModelVersionLength = 128
 const MaxSceneLength = 32
 const MaxRequestIDLength = 64
 const RecentExposureWindow = 7 * 24 * time.Hour
+const SourceVector = "vector"
 
 const ExposureDecisionReasonFresh = "fresh"
 const ExposureDecisionReasonRecentlyExposed = "recently_exposed"
@@ -23,12 +25,14 @@ type CandidateRequest struct {
 }
 
 type Cursor struct {
-	RankScore   float64
-	PublishedAt time.Time
-	VideoID     int64
+	ModelVersion string
+	RankScore    float64
+	PublishedAt  time.Time
+	VideoID      int64
 }
 
 type Candidate struct {
+	ModelVersion   string
 	VideoID        int64
 	AuthorID       int64
 	RankScore      float64
@@ -206,5 +210,7 @@ func RestoreExposureDecision(videoID int64, allowed bool, reason string, lastExp
 }
 
 func (c *Cursor) Valid() bool {
-	return c != nil && c.VideoID > 0 && !c.PublishedAt.IsZero() && !math.IsNaN(c.RankScore) && !math.IsInf(c.RankScore, 0)
+	return c != nil && c.VideoID > 0 && !c.PublishedAt.IsZero() &&
+		strings.TrimSpace(c.ModelVersion) != "" && len(c.ModelVersion) <= MaxModelVersionLength &&
+		!math.IsNaN(c.RankScore) && !math.IsInf(c.RankScore, 0) && c.RankScore >= -1 && c.RankScore <= 1
 }

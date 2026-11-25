@@ -3,6 +3,7 @@ package applicationfeed
 import (
 	applicationrecommendation "GCFeed/internal/application/recommendation"
 	domainfeed "GCFeed/internal/domain/feed"
+	domainrecommendation "GCFeed/internal/domain/recommendation"
 	inframetrics "GCFeed/internal/infra/metrics"
 	"context"
 	"crypto/sha1"
@@ -111,6 +112,7 @@ type RecommendStrategy struct {
 	repo        domainfeed.Repository
 	cache       FeedCache
 	recommender Recommender
+	timeline    Strategy
 }
 
 type Recommender interface {
@@ -162,7 +164,7 @@ func WithFeedCache(cache FeedCache) Option {
 func WithRecommender(recommender Recommender) Option {
 	return func(s *Service) {
 		if recommender != nil {
-			s.RegisterStrategy(NewRecommendStrategy(s.repo, recommender))
+			s.RegisterStrategy(NewRecommendStrategy(s.repo, recommender, s.strategies[domainfeed.SceneTimeline]))
 		}
 	}
 }
@@ -484,10 +486,11 @@ func (s *FollowingStrategy) listFollowingItems(ctx context.Context, viewerID int
 }
 
 // NewRecommendStrategy 创建推荐 Feed 策略。
-func NewRecommendStrategy(repo domainfeed.Repository, recommender Recommender) *RecommendStrategy {
+func NewRecommendStrategy(repo domainfeed.Repository, recommender Recommender, timeline Strategy) *RecommendStrategy {
 	return &RecommendStrategy{
 		repo:        repo,
 		recommender: recommender,
+		timeline:    timeline,
 	}
 }
 
@@ -501,6 +504,14 @@ func (s *RecommendStrategy) List(ctx context.Context, req FeedRequest) (*FeedRes
 	if req.ViewerID <= 0 {
 		return nil, domainfeed.ErrViewerRequired
 	}
+	// A continuation must keep the order from page one, even after deploying a snapshot.
+	if cursor, ok := strings.CutPrefix(req.Cursor, timelineCursorPrefix); ok {
+		if cursor == "" {
+			return nil, domainfeed.ErrInvalidCursor
+		}
+		req.Cursor = cursor
+		return s.latestPage(ctx, req)
+	}
 	limit := normalizeLimit(req.Limit)
 	result, err := s.recommender.Recommend(ctx, applicationrecommendation.CandidateRequest{
 		UserID:    req.ViewerID,
@@ -510,6 +521,9 @@ func (s *RecommendStrategy) List(ctx context.Context, req FeedRequest) (*FeedRes
 		Limit:     limit,
 	})
 	if err != nil {
+		if req.Cursor == "" && errors.Is(err, domainrecommendation.ErrSnapshotMissing) {
+			return s.latestPage(ctx, req)
+		}
 		if errors.Is(err, applicationrecommendation.ErrLoadRecommendationFailed) {
 			return nil, ErrLoadFeedFailed
 		}
@@ -535,6 +549,21 @@ func (s *RecommendStrategy) List(ctx context.Context, req FeedRequest) (*FeedRes
 		NextCursor: result.NextCursor,
 		HasMore:    result.HasMore,
 	}, nil
+}
+
+const timelineCursorPrefix = "latest."
+
+func (s *RecommendStrategy) latestPage(ctx context.Context, req FeedRequest) (*FeedResult, error) {
+	req.Scene = domainfeed.SceneTimeline
+	page, err := s.timeline.List(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	page.Scene = domainfeed.SceneRecommend
+	if page.NextCursor != "" {
+		page.NextCursor = timelineCursorPrefix + page.NextCursor
+	}
+	return page, nil
 }
 
 // RefreshFeed 从第一页重新加载默认 Feed，适合下拉刷新场景。

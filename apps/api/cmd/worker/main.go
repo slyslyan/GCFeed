@@ -6,9 +6,7 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
-	"time"
 
-	applicationembedding "GCFeed/internal/application/embedding"
 	applicationinteraction "GCFeed/internal/application/interaction"
 	applicationvideo "GCFeed/internal/application/video"
 	infracache "GCFeed/internal/infra/cache"
@@ -16,11 +14,9 @@ import (
 	infradatabase "GCFeed/internal/infra/database"
 	inframetrics "GCFeed/internal/infra/metrics"
 	inframq "GCFeed/internal/infra/mq"
-	infraembedding "GCFeed/internal/infra/persistence/embedding"
 	infrafeed "GCFeed/internal/infra/persistence/feed"
 	infrainteraction "GCFeed/internal/infra/persistence/interaction"
 	migration "GCFeed/internal/infra/persistence/migration"
-	infravector "GCFeed/internal/infra/vector"
 
 	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -89,28 +85,7 @@ func startWorkers(ctx context.Context, cfg *infraconfig.Config, gormDB *gorm.DB,
 	feedRepo := infrafeed.New(gormDB)
 	feedPreheater := applicationvideo.NewFeedPreheater(feedRepo, feedCache)
 	fanoutWorker := applicationvideo.NewFanoutWorker(feedRepo, rabbitMQ, feedCache, feedPreheater)
-	if err := fanoutWorker.Start(ctx); err != nil {
-		return err
-	}
-
-	embeddingRepo := infraembedding.New(gormDB)
-	embeddingService := applicationembedding.New(embeddingRepo, nil)
-	if cfg.Milvus.Address != "" {
-		// Milvus 未就绪不阻塞 worker 启动；就绪后回调把存量向量回填进向量库（主键 upsert 幂等）。
-		store := infravector.NewLazyStore(ctx, cfg.Milvus.Address, 5*time.Second)
-		embeddingService = applicationembedding.New(
-			embeddingRepo,
-			nil,
-			applicationembedding.WithVectorStore(store),
-		)
-		store.OnReady(func() {
-			if err := embeddingService.BackfillVectorStore(ctx, 500); err != nil && ctx.Err() == nil {
-				log.Printf("milvus backfill failed: %v", err)
-			}
-		})
-	}
-	embeddingWorker := applicationembedding.NewVideoEmbeddingWorker(embeddingService, rabbitMQ)
-	return embeddingWorker.Start(ctx)
+	return fanoutWorker.Start(ctx)
 }
 
 func closeSQL(db *sql.DB) {

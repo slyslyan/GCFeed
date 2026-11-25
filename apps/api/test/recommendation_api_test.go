@@ -71,8 +71,6 @@ type recommendationExposureResponse struct {
 type memoryRecommendationRepo struct {
 	mu        sync.Mutex
 	pool      []*domainrecommendation.Candidate
-	vectors   map[int64][]float64
-	interest  map[int64][]float64
 	published map[int64]bool
 	exposures map[string]*domainrecommendation.Exposure
 }
@@ -81,77 +79,45 @@ func newMemoryRecommendationRepo() *memoryRecommendationRepo {
 	base := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
 	return &memoryRecommendationRepo{
 		pool: []*domainrecommendation.Candidate{
-			domainrecommendation.RestoreCandidate(1, 10, 0, 0, 8, 0, "", base.Add(-4*time.Hour)),
-			domainrecommendation.RestoreCandidate(2, 20, 0, 0, 40, 0, "", base.Add(-3*time.Hour)),
-			domainrecommendation.RestoreCandidate(3, 30, 0, 0, 8, 0, "", base.Add(-2*time.Hour)),
-			domainrecommendation.RestoreCandidate(4, 20, 0, 0, 6, 0, "", base.Add(-1*time.Hour)),
-		},
-		vectors: map[int64][]float64{
-			1: {1, 0},
-			2: {0, 1},
-			3: {1, 0},
-			4: {0.7, 0.3},
-		},
-		interest: map[int64][]float64{
-			42: {1, 0},
+			testModelCandidate(1, 10, 1, base.Add(-4*time.Hour)),
+			testModelCandidate(2, 20, 0, base.Add(-3*time.Hour)),
+			testModelCandidate(3, 30, 1, base.Add(-2*time.Hour)),
+			testModelCandidate(4, 20, .9, base.Add(-1*time.Hour)),
 		},
 		published: map[int64]bool{1: true, 2: true, 3: true, 4: true},
 		exposures: map[string]*domainrecommendation.Exposure{},
 	}
 }
 
-func (r *memoryRecommendationRepo) ListCandidatePool(ctx context.Context, userID int64, limit int) ([]*domainrecommendation.Candidate, error) {
+func testModelCandidate(id, authorID int64, similarity float64, publishedAt time.Time) *domainrecommendation.Candidate {
+	return &domainrecommendation.Candidate{ModelVersion: "two-tower-test-v1", VideoID: id, AuthorID: authorID, Similarity: similarity, PublishedAt: publishedAt, Source: domainrecommendation.SourceVector}
+}
+
+// Recall 返回离线模型已有分数；测试不再在请求路径用手工用户画像重算。
+func (r *memoryRecommendationRepo) Recall(ctx context.Context, userID int64, limit int) ([]*domainrecommendation.Candidate, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	items := make([]*domainrecommendation.Candidate, 0, len(r.pool))
 	for _, item := range r.pool {
-		if item == nil {
-			continue
-		}
-		if r.exposures[recommendationExposureKey(userID, item.VideoID)] != nil {
+		if item == nil || !r.published[item.VideoID] {
 			continue
 		}
 		value := *item
 		items = append(items, &value)
 	}
 	sort.Slice(items, func(i, j int) bool {
-		if items[i].HotScore == items[j].HotScore {
-			if items[i].PublishedAt.Equal(items[j].PublishedAt) {
-				return items[i].VideoID > items[j].VideoID
-			}
+		if items[i].Similarity != items[j].Similarity {
+			return items[i].Similarity > items[j].Similarity
+		}
+		if !items[i].PublishedAt.Equal(items[j].PublishedAt) {
 			return items[i].PublishedAt.After(items[j].PublishedAt)
 		}
-		return items[i].HotScore > items[j].HotScore
+		return items[i].VideoID > items[j].VideoID
 	})
 	if limit > 0 && limit < len(items) {
 		items = items[:limit]
 	}
 	return items, nil
-}
-
-func (r *memoryRecommendationRepo) LoadUserInterestVector(ctx context.Context, userID int64) ([]float64, bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	vector := r.interest[userID]
-	if len(vector) == 0 {
-		return nil, false, nil
-	}
-	return append([]float64(nil), vector...), true, nil
-}
-
-func (r *memoryRecommendationRepo) LoadVideoVectors(ctx context.Context, videoIDs []int64) (map[int64][]float64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	vectors := map[int64][]float64{}
-	for _, videoID := range videoIDs {
-		if vector := r.vectors[videoID]; len(vector) > 0 {
-			vectors[videoID] = append([]float64(nil), vector...)
-		}
-	}
-	return vectors, nil
 }
 
 func (r *memoryRecommendationRepo) ListRecentExposures(ctx context.Context, userID int64, videoIDs []int64, since time.Time) ([]*domainrecommendation.Exposure, error) {
@@ -352,6 +318,7 @@ func TestRecommendFeedScene(t *testing.T) {
 	recommendationRepo := newMemoryRecommendationRepo()
 	recommendationService := applicationrecommendation.New(
 		recommendationRepo,
+		applicationrecommendation.WithRecaller(recommendationRepo),
 		applicationrecommendation.WithNow(func() time.Time {
 			return time.Date(2026, 5, 3, 13, 0, 0, 0, time.UTC)
 		}),
@@ -379,8 +346,10 @@ func TestRecommendFeedScene(t *testing.T) {
 func newRecommendationRouter() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	repo := newMemoryRecommendationRepo()
 	service := applicationrecommendation.New(
-		newMemoryRecommendationRepo(),
+		repo,
+		applicationrecommendation.WithRecaller(repo),
 		applicationrecommendation.WithNow(func() time.Time {
 			return time.Date(2026, 5, 3, 13, 0, 0, 0, time.UTC)
 		}),

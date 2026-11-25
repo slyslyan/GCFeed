@@ -3,6 +3,7 @@ package interfaceshttpfeed
 import (
 	applicationfeed "GCFeed/internal/application/feed"
 	domainfeed "GCFeed/internal/domain/feed"
+	domainrecommendation "GCFeed/internal/domain/recommendation"
 	interfaceshttpmiddleware "GCFeed/internal/interfaces/http/middleware"
 	"errors"
 	"net/http"
@@ -147,6 +148,11 @@ func feedItemsResponseFromResult(result *applicationfeed.FeedResult) feedItemsRe
 
 // writeFeedError 统一 Feed 接口错误响应。
 func writeFeedError(c *gin.Context, err error) {
+	if errors.Is(err, domainrecommendation.ErrModelUnavailable) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "recommendation model unavailable"})
+		return
+	}
+
 	if errors.Is(err, domainfeed.ErrViewerRequired) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -160,7 +166,7 @@ func writeFeedError(c *gin.Context, err error) {
 
 // isBadRequestError 判断 Feed 参数错误。
 func isBadRequestError(err error) bool {
-	return errors.Is(err, domainfeed.ErrInvalidLimit) ||
+	return errors.Is(err, domainrecommendation.ErrInvalidCursor) || errors.Is(err, domainfeed.ErrInvalidLimit) ||
 		errors.Is(err, domainfeed.ErrInvalidCursor) ||
 		errors.Is(err, domainfeed.ErrUnsupportedScene)
 }
