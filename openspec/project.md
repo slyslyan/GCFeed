@@ -11,6 +11,7 @@ GCFeed is a short-video Feed system. It provides a practical engineering baselin
 - Redis for Feed cache, hot ranking, counters, and short-lived state.
 - RabbitMQ for asynchronous write-behind and fanout work.
 - JWT for API authentication.
+- Python 3.9+ standard library for offline CPU training of the recommendation model. The Go API loads the exported user and video vectors from one snapshot and searches with Milvus or, for a small catalog, in process.
 - React and Vite for the Web client.
 - OpenSpec for change proposals and long-lived capability specifications.
 
@@ -39,6 +40,8 @@ Config -> DB/Redis/RabbitMQ/JWT -> Repository -> Service -> Handler -> Router
 - `docs/optimization.md`: Feed performance and stability strategy.
 - `docs/uiux.md`: Web UI/UX specification.
 - `docs/modules/*.md`: module-level designs.
+- [Recommendation](../docs/modules/recommendation.md) describes candidate selection, pagination, and the timeline fallback when the snapshot file is missing.
+- [Two-tower training](../tools/twotower/README.md) covers exporting viewing events, evaluating on later interactions, and producing the serving snapshot.
 
 ## Conventions
 

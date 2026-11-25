@@ -11,7 +11,8 @@ GCFeed 是一个面向短视频场景的 Feed 系统工程。项目用 Go API �
 - MySQL + GORM 持久化。
 - JWT 登录态。
 - Redis Feed 缓存、热榜和互动计数。
-- RabbitMQ 异步互动落库、视频发布事件和向量任务。
+- RabbitMQ 异步互动落库和视频发布事件。
+- 推荐频道使用 CPU 离线训练的双塔向量单路召回，使用个人或默认用户向量；模型文件不存在时推荐首屏展示最新流。
 - React + Vite Web 客户端。
 - 消息中心和播放优化接入。
 - API 流程测试和 Web 生产构建。
@@ -79,6 +80,27 @@ docker compose down -v
 | RabbitMQ 管理台 | `http://127.0.0.1:15672` |
 | Prometheus | `http://127.0.0.1:9090` |
 | Grafana 面板 | `http://127.0.0.1:3000/d/gcfeed-overview/gcfeed-overview` |
+
+### 启用双塔推荐
+
+本节训练和模型重启命令均从仓库根目录执行。
+
+登录后可访问推荐频道；模型文件不存在时，首屏按发布时间倒序展示，后续分页继续沿用同一最新流顺序。启用个性化需要从当前 GCFeed 实例导出视频和有效观看行为，按[训练说明](tools/twotower/README.md)完成时间切分评估和全量训练，将完整快照放在 `apps/api/models/twotower.json`，然后执行：
+
+```bash
+docker compose -f apps/docker-compose.yml restart api
+docker compose -f apps/docker-compose.yml logs --tail=100 api
+```
+
+Python 3.9+ 标准库即可训练，不需要 GPU 或额外机器学习依赖。默认 Compose 使用 Milvus 检索，需等本批次索引加载完成；小型本地目录可将 API 配置中的 `milvus.address` 设为空字符串，使用内存精确余弦检索。模型在 API 启动时加载，用户画像和新视频向量随下一份快照更新。本地运行时重启 Go API 即可。
+
+演示训练可单独运行，不依赖数据库：
+
+```bash
+python3 tools/twotower/train.py --demo --epochs 12 --k 3 --output /tmp/gcfeed-two-tower-demo.json
+```
+
+演示数据的 ID 仅适用于配套样例；部署快照应由本实例的数据生成。合成样例的离线指标不能代表真实用户效果。
 
 ### 本地开发
 
@@ -161,6 +183,7 @@ Prometheus 抓取目标：
 | [docs/engineering.md](docs/engineering.md) | 工程规范、目录规则、API 风格、测试约定 |
 | [docs/optimization.md](docs/optimization.md) | Feed 性能和稳定性专题 |
 | [docs/performance-testing.md](docs/performance-testing.md) | k6 压测、QPS/P95 解读、Grafana 指标观察 |
+| [tools/twotower/README.md](tools/twotower/README.md) | CPU 双塔训练、留出评估、全量导出和模型上线 |
 | [docs/uiux.md](docs/uiux.md) | Web 客户端 UI/UX 规格 |
 | [docs/modules/](docs/modules/README.md) | 各业务模块设计 |
 | [openspec/](openspec/) | OpenSpec 项目基线和变更规格 |

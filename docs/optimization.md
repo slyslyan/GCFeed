@@ -30,6 +30,8 @@ flowchart LR
 
 Redis 用于读性能和短期状态，RabbitMQ 用于削峰和异步落库，MySQL 保存最终事实。
 
+推荐当前使用独立的 CPU 离线双塔训练与快照检索链路，见[推荐模块](modules/recommendation.md)。本文的优化清单和验收指标包含后续工作，不代表已经测得吞吐或延迟收益。
+
 ## 3. P0 优化清单
 
 | 编号 | 问题 | 策略 | 验收指标 |
@@ -91,6 +93,7 @@ Redis 用于读性能和短期状态，RabbitMQ 用于削峰和异步落库，My
 | --- | --- | --- |
 | Timeline | `published_at DESC, id DESC` | `published_at`、`video_id` |
 | Hot | `hot_score DESC, video_id DESC` | `window_end`、`offset` |
+| Recommend | 双塔相似度、发布时间、视频 ID；分页后同作者打散 | 模型版本、`rank_score`、`published_at`、`video_id` |
 | 评论 | `created_at DESC, id DESC` | `created_at`、`comment_id` |
 
 验收：
@@ -190,3 +193,18 @@ feed:hot:window:v1:{windowEndUnix}
 3. 再完成互动异步落库与 Worker 幂等。
 4. 再补发布 fanout 和 Hot 窗口缓存。
 5. 最后补监控指标和降级开关。
+
+## 12. 双塔推荐的当前边界与验收
+
+离线训练使用视频元数据和有效观看历史，导出同一批用户、默认用户、视频向量；API 请求不扫描近期行为来现场构造兴趣向量。模型检索候选经 MySQL 状态校验和近期曝光过滤后分页打散，卡片组装复用现有批量读取。具体训练和部署步骤见[训练说明](../tools/twotower/README.md)。
+
+测量应分开覆盖：
+
+| 范围 | 需要记录和核对 |
+| --- | --- |
+| CPU 训练 | 数据规模、每条特征数、epoch、耗时、内存和跳过负采样次数 |
+| 离线质量 | 时间分界、整体/暖用户/冷用户的 Recall@K、MRR@K、NDCG@K、候选规模与热门基线 |
+| 在线检索 | 模型版本、目录规模、本机精确检索或 Milvus、Feed 延迟、错误率、CPU 与数据库压力 |
+| 数据闭环 | 有效观看与完播入库、请求去重、新训练批次加载后历史生效 |
+
+缺失快照时推荐会复用最新流，此时的 200 响应和缓存命中不能证明双塔性能。模型损坏或索引未就绪应返回 503；有效模型候选不足应保留空结果。新视频、新观看在下次训练发布后更新；在线增量编码与训练属于未来能力，当前没有实测收益可以支撑追加复杂度。

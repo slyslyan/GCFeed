@@ -2,90 +2,41 @@
 
 ## 1. 模块职责
 
-推荐模块负责候选召回、排序打散和曝光去重，为 Feed 提供可下发的视频列表。
+推荐模块负责 CPU 双塔模型的候选检索、相似度排序、同作者打散和曝光去重，为 Feed 提供可下发的视频列表。模型在离线训练阶段学习，Go API 使用训练导出的用户、默认用户与视频向量快照；当前没有在线画像更新或在线训练服务。
 
 ## 2. 接口设计
 
-| 方法 | 接口路径 | 作用 | 鉴权 | 幂等键 |
-| --- | --- | --- | --- | --- |
-| POST | `/internal/recommendation-candidates` | 一次完成召回、排序、打散 | 服务鉴权 | 支持 |
-| POST | `/internal/exposure-decisions` | 判断候选是否近期曝光 | 服务鉴权 | 支持 |
-| POST | `/internal/exposures` | 写入曝光记录 | 服务鉴权 | 支持 |
-
-## 3. 数据表设计
-
-### 3.1 `reco_rule`
-
-| 字段 | 类型 | 约束 | 说明 |
-| --- | --- | --- | --- |
-| `id` | BIGINT | PK | 规则 ID |
-| `scene` | VARCHAR(32) | NOT NULL | 场景，如 `feed` |
-| `config_json` | JSON | NOT NULL | 召回、排序、打散参数 |
-| `enabled` | TINYINT | NOT NULL, DEFAULT 1 | 是否启用 |
-| `updated_at` | DATETIME | NOT NULL | 更新时间 |
-
-索引建议：`uk_scene(scene)`。
-
-### 3.2 `reco_exposure_log`
-
-| 字段 | 类型 | 约束 | 说明 |
-| --- | --- | --- | --- |
-| `id` | BIGINT | PK | 记录 ID |
-| `user_id` | BIGINT | NOT NULL | 用户 ID |
-| `video_id` | BIGINT | NOT NULL | 视频 ID |
-| `scene` | VARCHAR(32) | NOT NULL | 场景 |
-| `request_id` | VARCHAR(64) | NOT NULL | 请求 ID |
-| `exposed_at` | DATETIME | NOT NULL | 曝光时间 |
-
-索引建议：`idx_user_scene_time(user_id, scene, exposed_at)`、`idx_request_id(request_id)`。
-
-## 4. 业务规则
-
-| 规则 | 说明 |
-| --- | --- |
-| 候选只返回上线视频 | 下架、删除和异常视频不进入候选 |
-| 曝光去重按用户生效 | 同一用户近期曝光过的视频降低或移除优先级 |
-| 打散避免同作者集中 | 同一作者的视频在单页中保持间隔 |
-| 请求携带 scene | 不同 Feed 场景可使用不同策略 |
-| 内部接口支持幂等 | 重复曝光写入不会产生重复事实 |
-
-## 5. 测试建议
-
-| 场景 | 期望 |
-| --- | --- |
-| 请求推荐候选 | 返回上线视频列表 |
-| 同一作者候选过多 | 结果被打散 |
-| 判断近期曝光视频 | 返回已曝光状态 |
-| 写入曝光记录 | 记录 request_id 和曝光时间 |
-| 重复写入曝光 | 结果稳定 |
-
-## 6. 前端接入点
-
-推荐模块主要服务后端 Feed。前端通过 Feed 接口间接使用推荐结果。
-
-## 7. 多路召回（当前实现）
-
-推荐链路采用三路召回 + 合并器的分层结构：
-
-| 召回路 | 来源 | 解决什么问题 |
+| 方法 | 接口路径 | 作用 |
 | --- | --- | --- |
-| 热度召回 | `video` + `video_stat`，hot_score 倒序 | 普适兜底，冷启动用户保障 |
-| 关注召回 | `user_follow` JOIN `video`，关注作者 72h 内新视频 | 新视频冷启动（关系链社交信号） |
-| 向量召回 | Milvus 2.4 `video_embedding` collection（128 维 hash-ngram + HNSW/COSINE 索引） | 个性化（用户兴趣向量 ANN topK） |
+| POST | `/internal/recommendation-candidates` | 返回双塔召回并打散后的候选 |
+| POST | `/internal/exposure-decisions` | 判断候选是否近期曝光 |
+| POST | `/internal/exposures` | 写入曝光记录 |
 
-- 召回层抽象：`Recaller` 接口 + `Merger` 合并器（去重、热度补齐、关注路配额保底、曝光剔除）。
-- 三路并发执行，单路超时（500ms）或失败只丢弃该路结果，不影响其他路；无召回器注册时回退单路热度池。
-- 向量路选型：MySQL 8.4 Community 实测不支持 VECTOR 类型（1064 语法错误、无 STRING_TO_VECTOR），改选 Milvus standalone（etcd + minio + milvus docker compose 部署，`infra/vector/milvus.go` 封装 `VectorStore` 接口）。
-- 向量写入：embedding worker 生成向量后 MySQL 落库 + Milvus 双写（失败只记日志不阻塞消息流），worker 启动时对存量向量按主键 upsert 幂等回填；Milvus 未就绪不阻塞服务启动（`LazyStore` 后台重试连接 + 建集合），向量路就绪前自动降级。
-- 向量路 ANN 查询不带业务过滤，状态/时间过滤在应用层完成（`enrichVideos` 批量校验 status + 30 天窗口）。
-- Milvus COSINE 距离即 1 - 余弦相似度，召回距离直接换算为粗排 similarity 特征；关注路候选有新鲜度加成，避免低热度新视频被公式压底。
-- 关注路双保险：72h 时间窗口 + 条数硬上限（200），防止大 V 刷屏撑爆候选池。
+## 3. 线上推荐与模型切换
 
-## 8. 未来规划：内容审核与黑名单
+面向 Web 的 `scene=recommend` Feed 需要登录。API 启动时从 `recommendation_model` 读取同一批导出的用户向量、默认用户向量和视频向量。离线训练、样本格式和评估方法见[训练说明](../../tools/twotower/README.md)。
 
-当前项目没有审核功能，因此没有黑名单机制（仅热度/关注/向量三路按状态过滤）。后续如果加入内容审核，建议路径：
+当前调用链：
 
-1. 新增审核能力（人工/机审判定视频违规），违规结果落库（`video.status` 或独立审核表）。
-2. 违规事件触发写 Redis 黑名单集合（如 `ban:video:{id}`，带 TTL）。
-3. 多路召回统一接入：热度/关注路 SQL 增加黑名单过滤，向量路 `enrichVideos` 应用层批量校验（`SMISMEMBER`）。
-4. 兜底：黑名单 Redis 不可用时跳过校验（与向量路降级同策略），优先保证可用性。
+```text
+Web 有效观看 / 完播 → video_view_events
+video + video_view_events 只读导出 → Python 标准库 CPU 双塔训练 / 时间留出评估
+同批 128 维用户、默认用户和视频向量快照 → 重启 API 加载
+Feed 推荐策略 → 双塔检索 → MySQL 状态校验 → 曝光过滤 → 分页与作者打散 → 卡片组装
+```
+
+训练使用标题、简介、作者和目标事件之前的有效观看历史，两个塔的投影参数都参与学习。每个用户/视频只取第一次合格 `play` 或 `complete` 作为一个正反馈，后来的完播不会重复加权。曝光与快速划走不作为正例；未观看的视频只是采样负例，不代表用户明确不喜欢。训练、时间切分及指标局限以[训练说明](../../tools/twotower/README.md#标签与时间切分)为准。
+
+- 用户 ID 在快照中有个人向量时使用该向量，其余用户（包括首次访问或没有训练历史的用户）使用训练出的默认向量。推荐检索只使用双塔相似度。热门和关注仍是可以独立访问的频道。
+- 配置 Milvus 地址时，API 在后台分批 upsert 视频向量，使用包含快照内容摘要的独立集合，全批就绪后才查询。不同版本的用户向量和视频索引不会混用。目录较小时也可以将 `milvus.address` 留空，在 Go 进程内用同一快照计算精确相似度。
+- 检索适度超取候选，再通过 MySQL 检查视频和作者状态。服务据相似度去重、剔除近期曝光，分页后做同作者打散。游标记录模型版本，快照升级后旧模型游标需要从第一页刷新。
+- 缺少快照时，推荐首屏复用最新流的查询、缓存与排序。续页游标绑定最新流，即使期间升级模型也沿用原顺序。返回的频道仍是 `recommend`。有效快照没有合适候选时返回空列表；模型文件损坏、Milvus 未就绪或索引不可用时推荐返回 503。
+- 新视频进入下次快照。滚动更新时应协调各 API 实例的模型版本，待旧版本不再使用后再清理其集合。由旧版本升级时，确认旧 worker 已退役后，解除原 `gcfeed.video.embedding` 队列与视频发布事件的绑定，避免旧队列继续积压。
+
+观看上报会持久化行为，并可发布 `ViewEventRecordedEvent`；当前 worker 只运行互动落库和视频 fanout，这条消息不会自动更新双塔快照。新增观看历史在下次全量训练、导出并重启 API 后生效。
+
+## 4. 验证边界
+
+模型验证应分别覆盖有历史用户、无个人向量用户、曝光剔除、视频/作者状态变化、模型版本切换，以及快照缺失、损坏、索引未就绪三类不同状态。快照有效但候选被过滤完时允许空列表，不能用其他频道补齐。
+
+训练器的演示集和损失曲线只证明流程可运行；真实数据按时间留出，比较 Recall@K、MRR@K、NDCG@K 与训练期热门基线，才可判断离线排序表现。离线指标和接口压测都不能直接证明线上观看或留存提升。

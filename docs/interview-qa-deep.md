@@ -1,6 +1,6 @@
 # GCFeed 面试深度讲解
 
-本文档围绕 GCFeed（短视频 Feed 系统）的五大核心能力展开，每节含基础问题、追问及详细答案，用于面试深度复盘。
+本文档围绕 GCFeed 的 Feed、互动、播放、稳定性、工程化和双塔推荐展开。推荐训练与服务接入可对照[训练目录说明](../tools/twotower/README.md)复现。
 
 ---
 
@@ -20,7 +20,7 @@
 |----|-------|------|---------|------|
 | 时间线 | `timeline` | `published_at DESC, id DESC` | MySQL 全量视频表 | 无需登录 |
 | 热榜 | `hot` | 互动热度分 DESC | Redis ZSET 60 分钟滑动窗口 | 无需登录 |
-| 推荐 | `recommend` | RankScore DESC | 基于曝光去重 + 候选排序 | 需登录（POST /api/feed-queries） |
+| 推荐 | `recommend` | 模型相似度排序后页内作者打散 | 单路双塔向量检索 + 状态/曝光过滤 | GET 或 POST 均需登录 |
 | 关注 | `following` | `published_at DESC` | Redis ZSET inbox + 大 V outbox 合并 | 需登录 |
 
 Feed Service 根据 scene 分发到不同策略函数，返回统一结构 `items + next_cursor + has_more`。
@@ -112,11 +112,11 @@ TTL 策略：分钟桶 2 小时（防止窗口滑动时历史桶丢失），合�
 
 **Q6: 推荐流的去重是怎么做的？**
 
-答：通过曝光记录表 `exposures(user_id, video_id)` 做 7 天内去重。每次推荐请求时查询该用户最近 7 天的曝光记录，从推荐候选集中过滤掉已曝光的视频。曝光事件通过独立的 `exposure` exchange → `gcfeed.exposure.view_event_recorded` 队列异步写入，不阻塞 Feed 响应。
+答：推荐 Service 查询 MySQL `exposures`，排除该用户最近 7 天曝光过的候选。客户端在条目展示时调用 `POST /api/video-view-events`，服务在事务中同步保存 `video_view_events` 并更新曝光聚合；带 request_id 的同用户、视频、场景、请求及事件类型有唯一去重键。流水保存后仍可尽力投递 MQ，但现有 Worker 不消费它来更新画像，训练也直接读取 MySQL。它能过滤已成功上报的曝光，不能保证尚未落库的并发请求之间互斥。
 
 **Q7: 如果页缓存失效（Redis 挂了），Feed 接口还能用吗？**
 
-答：能。每一层缓存都有回源路径——页缓存 miss → 直接查 MySQL 获取 ID 列表 → 卡片 miss → 批量查 MySQL → 计数 miss → 批量查 MySQL。没有 Redis 只是延迟升高（从 5ms 升到几十 ms），不会 500。这是"缓存优先，MySQL 兜底"的设计原则。
+答：timeline 的页、卡片和计数缓存失败时可以批量回源 MySQL，但服务能否继续成功还依赖数据库容量。推荐复用卡片回源能力，模型检索本身由本地快照或 Milvus 提供，曝光过滤读 MySQL。模型文件缺失的推荐首屏可回退最新流；文件损坏或 Milvus 故障返回 503。这几种故障不能统称为缓存 miss，也不能据此承诺所有 Feed 故障都成功返回。
 
 **Q8: inbox 为什么限制 1000 条？超出怎么办？**
 
@@ -265,18 +265,16 @@ Go 侧 `http.ServeContent` 会自动处理 Range 请求、If-Modified-Since、ET
 
 前端播放器根据当前网络类型调用 `/api/playback/config` 获取配置，在播放第一个视频时后台预加载后续视频的首个分片。WiFi 下可以预加载完整的 3 个视频，4G 下只预加载首字节（最小化流量消耗）。
 
-**Q4: 播放 QoS 埋点怎么设计？**
+**Q4: 观看反馈与播放 QoS 如何分别进入推荐和体验分析？**
 
-答：通过曝光/播放事件上报，记录完整播放质量数据：
+答：当前有两条独立记录路径。
 
-- `event_type`: exposed / play / complete / skip
-- `watch_ms`: 实际观看时长
-- `completed`: 是否完整播放
-- `scene`: 来源场景（timeline/hot/recommend/following）
-- `request_id`: 关联推荐请求
+- `POST /api/video-view-events` 记录 `exposed/play/complete/skip`、`watch_ms`、`completed`、scene 和 request_id。流水先同步保存到 MySQL；`exposed` 同事务更新曝光聚合，供近期去重。
+- `POST /api/playback-qos-reports` 保存首帧耗时、卡顿次数和观看时长到 `playback_qos_log`，用于播放体验排查。当前训练器不读这张 QoS 表。
 
-数据通过 RabbitMQ 异步写入 `video_view_events` 表，不阻塞 API 响应。分析维度：完播率 = complete_count / play_count，跳过率 = skip_count / exposed_count，按 scene 分维度对比推荐效果。
+前端按可见、正在播放的视频进度累计有效观看，暂停、隐藏、拖动不会直接累加观看时间；覆盖视频时长 95% 判为完播，达到 3 秒有效观看或实际完播时形成正向 play，并可上报 complete。服务端按 request_id 等字段去重重试事件；训练再按用户/视频保留第一次合格正例，避免先 play、后 complete 重复增加训练目标。
 
+用户向量不会随每次观看在线更新。离线训练使用截止时间前的合格流水，后续行为经下一轮导出、训练和 API 重启后生效。exposed 和快速划走不作为正例，当前也没有实现基于 skip 的强负反馈学习。
 
 ---
 
@@ -392,6 +390,8 @@ Readiness/Liveness 探针：API 容器暴露 `/health` 端点做探活，MySQL/R
 
 Prometheus 每 15s scrape `:8080/metrics` (API) 和 `:9091/metrics` (Worker)。
 
+这些应用指标记录请求与 Worker 执行情况；当前没有双塔 Recall@K、模型目录覆盖或模型就绪的专用 Prometheus 指标。双塔离线指标由训练器写入 `<output>.metrics.json`，模型索引就绪需核对 API 的 `two-tower index ready` 日志。推荐缺快照回退最新流仍可能返回 200，HTTP 成功率不能代替模型链路验证。
+
 **Q3: 压测结果具体是多少？怎么测的？**
 
 答：使用 k6 进行压力测试，核心数据：
@@ -407,7 +407,7 @@ Prometheus 每 15s scrape `:8080/metrics` (API) 和 `:9091/metrics` (Worker)。
 | HTTP 失败率 | 0.00% |
 | 业务成功率 | 100.00% |
 
-k6 脚本通过 `SCENE` 环境变量切换 timeline/hot/recommend/following 四种场景。极限压测逐步提升 VUS（50→100→200），`THINK_TIME=0` 下测试服务极限吞吐。
+`docs/performance-testing.md` 的公开 Feed 脚本可用 `SCENE` 选择 timeline/hot；推荐压测使用其中登录后调用 `POST /api/feed-queries` 的独立脚本，并先验证模型就绪与候选来源。缺快照回退最新流仍可成功返回，不能将其压测成绩当作双塔推荐吞吐。极限吞吐测试再逐步提高 VUS、设置 `THINK_TIME=0`，并分别记录所测场景。
 
 阈值设定：`http_req_failed < 1%`、`http_req_duration p95 < 500ms`、`feed_success_rate > 99%`。
 
@@ -454,3 +454,82 @@ k6 脚本通过 `SCENE` 环境变量切换 timeline/hot/recommend/following 四�
 3. **RabbitMQ Worker**：互动量大了以后 Worker 消费速度跟不上。解法：增加 Worker 实例（水平扩展）、互动计数批量写入 MySQL（减少单条 INSERT 事务开销）。
 4. **微服务拆分**：`docs/evolution.md` 定义了四阶段拆分路线——先拆 Recommend Service → 再拆 Feed/Interaction Service → gRPC 通信 → 独立数据库。
 
+---
+
+## 6. CPU 双塔推荐：训练、服务与验证
+
+### 核心叙事
+
+> 从实际观看流水构造时间隔离的训练样本，在 CPU 上训练用户塔和视频塔，同批次导出向量快照。在线仅以模型相似度召回，完成状态校验、近期曝光过滤、稳定分页和页内作者打散；新数据通过下一批训练与部署更新。
+
+### 基础问题
+
+**Q1: 为什么这是可训练双塔，而不是固定文本 hash？**
+
+答：标题、描述的词/字符 ngram 与作者 ID 先形成固定 256 桶稀疏输入，每条最多 64 个特征；用户输入是当前训练目标发生前的有效观看视频特征之和。两个塔分别拥有可训练的投影矩阵和偏置，经过 tanh 与 L2 归一化输出 128 维向量，共 65,792 个参数。BPR 损失对正负视频得分差反向传播，同时更新两塔；默认用户向量是训练后用户塔对空历史的输出。
+
+实现使用 Python 3.9+ 标准库，适合先验证小型数据闭环，无 GPU 或深度学习框架依赖。性能边界需要在自身样本规模上测量；不能因为可在 CPU 跑通就推断能处理大规模流水。
+
+**Q2: 标签和用户历史怎样构造？**
+
+答：`complete`，或已完播/观看至少 `--min-watch-ms`（默认 3000ms）的 `play`，算合格正反馈。每个用户/视频只取首次合格事件，等权作为目标；后来的完播不会回填早期样本权重。exposed 与 skip 不作为正例，未观看也不能解释为明确不喜欢。
+
+用户历史只使用当前目标之前的正反馈；负例来自目标时刻已发布、用户此前没有正反馈的视频。每个 epoch 打乱的是已按时间构造好的样本，不会把训练中的未来目标加入历史。负采样有尝试上限，无法找到负例时会跳过更新并报告次数，不能把跳过当作成功学习。
+
+**Q3: Go 在线路径做哪些计算？**
+
+答：API 启动时读取完整 JSON，校验 128 维、归一化向量和合法 ID，并固定快照。已知用户用个人向量，未知用户用同批次 default_user。配置 Milvus 时用 COSINE ANN 检索；地址为空时，对相同快照做本地精确内积检索。向量已归一化，因此内积对应余弦相似度。
+
+当前只有这一条召回来源。Service 给 500 条窗口预算，召回器最多超采样三倍、且不超过模型目录；MySQL 富化过滤已发布状态、有发布时间与正常作者。随后校验分数、排序、视频去重、过滤 7 天曝光，再截到 500 条窗口。`RankScore=Similarity`，负分有效，不额外混入热度、新鲜度或关注配额；hot 与 following 是独立频道。
+
+**Q4: 页内作者打散会不会破坏游标？**
+
+答：游标包含模型文件摘要、分数、发布时间和视频 ID。先按相似度、发布时间、ID 倒序形成全序，按游标截取一页，使用打散前最后一项编码 next_cursor，再调整这一页的作者顺序。排序和游标使用相同的严格浮点比较，不用 epsilon 把近似分数当同分。更换模型后旧摘要游标返回 400，应刷新首屏。
+
+固定窗口在曝光过滤后最多 500 条；不同页大小仍使用相同窗口。末页并不表示全站没有更多内容，打散也无法在作者单一时保证每条作者都不同。详情组装阶段遇到删除或数据不可用时，页长还可能减少。
+
+**Q5: 缺模型、新用户和 Milvus 故障如何区分？**
+
+答：三者路径不同。
+
+- 新用户使用训练后默认用户向量，返回 `cold_start` 原因，属于正常模型召回。
+- 仅模型文件不存在，且是无游标首屏时，推荐频道展示最新视频。续页带 `latest.` 前缀，之后即使安装模型，也继续原时间线顺序；新开首屏才切换模型。
+- 文件损坏、向量不兼容、Milvus 未就绪或检索失败返回 503；模型续页中途丢文件也返回 503，不拼接最新流或热门内容。
+
+配置了 Milvus 时 API 后台每 5 秒重试索引准备。每个完整快照以文件 SHA-256 派生独立 collection，批量导入全部视频向量后才标记可检索。用户向量和索引不能跨批次混用。当前没有运行中热加载，替换文件后需重启 API。
+
+### 追问
+
+**Q6: 发布新视频与观看事件为什么不再触发推荐 embedding Worker？**
+
+答：服务文件只有同一训练批次的用户、视频、默认用户向量，没有在线编码器参数。发布事件 Worker 当前只做关注流 fanout 和卡片/计数预热；观看流水先保存到 MySQL，也没有正在运行的画像消费者来修改用户向量。新视频和新观看要经过离线导出、重训、完整快照部署后才进入模型状态，不能把遗留队列名或 embedding 单元测试当作线上执行证据。
+
+**Q7: 真实样本导出有哪些口径风险？**
+
+答：导出脚本是 `tools/twotower/export_videos.sql` 与 `export_events.sql`，分别读取当前已发布视频及其观看流水，输出 JSONL。需保证两个文件来自一致备份或暂停写入时的数据；两个普通客户端连接本身不能保证同一快照。MySQL DATETIME 没有时区，先核实历史存储口径，再传 `--source-timezone UTC` 或 `+08:00`。
+
+时间切分保证交互标签、用户历史与负例采样不使用未来信息，但当前目录只含现在仍发布的视频，存在幸存者偏差，标题/描述/作者也不是历史版本。因此不能声称完成了严格的历史线上回放。
+
+**Q8: 离线评估具体计算什么？热门基线为什么要保留？**
+
+答：`created_at<=cutoff` 用于训练，之后的合格目标用于评估。用户向量固定为截止时间前的历史输出，评估期间不更新画像；候选只包含目标时刻已发布内容，排除用户此前正反馈。每个评估事件一个相关视频，计算按事件平均的 Recall@K、MRR@K 和 NDCG@K，整体、暖用户和冷用户分别报告。这里 Recall@K 也就是命中率。
+
+热门基线只统计训练期行为，并用相同候选与过滤口径，检查模型是否比简单排序更有价值。还需看样本数和 `mean_candidates`，很小的目录可能让指标偏高；没有评估目标时指标是 null。演示集成绩、训练损失下降和离线领先都不等于线上收益，线上需受控用户实验。
+
+**Q9: 哪些命令可以复现训练与契约验证？**
+
+答：在仓库根目录执行合成数据演示和测试：
+
+```bash
+python3 tools/twotower/train.py --demo --epochs 1 --k 3 --output /tmp/gcfeed-two-tower-interview.json
+python3 -m unittest discover -s tools/twotower -p 'test_*.py' -v
+(cd apps/api && go test ./internal/infra/twotower ./internal/application/recommendation ./internal/domain/recommendation ./test -run 'TestServeTrainedSnapshot|TestRejectMismatchedVectors|TestRecommend|TestRecommendation|TestCursorValid' -count=1)
+```
+
+演示数据被明确标为合成，只验证构造、训练、指标与导出可以运行。真实数据先按训练目录 README 导出 JSONL，再指定视频/事件路径、已核实的源时区与 cutoff，不能把演示输出覆盖为真实用户效果报告。MySQL/Milvus gated 集成检查需额外提供测试环境；未配置时跳过不等于通过真实依赖验证。
+
+**Q10: 评估版本和上线版本如何区分？**
+
+答：用时间留出集比较候选方案后，保留评估报告；确定特征和参数后，可用 `--full-train` 重训全部合格历史生成服务文件。full-train 与 cutoff 互斥，没有留出评估，报告明确标记 `full_train_no_held_out_evaluation`、评估目标为 0、指标为 null。
+
+默认服务文件为 `apps/api/models/twotower.json`，Compose 将其所在目录只读挂载至 API `/app/models`。模型与 `<output>.metrics.json` 各自原子写入，核对 version 后发布；文件替换后重启 API，启用 Milvus 时检查本批次 `two-tower index ready` 日志。回滚也要整体替换同批次用户/视频向量。应用现有的请求和 Worker 指标可监控服务调用，但不证明模型训练成功或线上效果提升。

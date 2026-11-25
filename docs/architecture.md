@@ -1,10 +1,10 @@
-# 视频 Feed 系统架构图（MVP）
+# 视频 Feed 系统架构
 
-本文按 `mermaid-diagrams` skill 重构：每张图只表达一个概念，节点保持克制，连接线带语义标签，图前给出用途说明。当前实现以 Go API 单体承载账户、视频、Feed 与上传能力，后续能力以演进图呈现。
+GCFeed 由 Go API、异步 Worker 和 React Web 组成。推荐模型在 CPU 上离线训练，API 加载同批用户和视频向量，在本机或 Milvus 中检索。图中虚线表示离线数据传递或规划中的能力。[训练说明](../tools/twotower/README.md) · [推荐模块](modules/recommendation.md)
 
 ## 1. 系统上下文
 
-这张图展示 GCFeed 与客户端、存储和演进型基础设施的边界。
+这张图展示客户端、API、Worker、离线训练与存储的边界。对象存储迁移仍属规划。
 
 ```mermaid
 ---
@@ -33,20 +33,31 @@ flowchart LR
   Uploads[("uploads<br/>视频 / 封面 / 头像")]
   Redis[("Redis<br/>缓存与计数")]
   MQ[("MQ<br/>异步事件")]
+  Worker["Worker<br/>互动落库 / 视频 fanout"]
+  Trainer["CPU 双塔离线训练<br/>Python 标准库"]
+  Snapshot[("JSON 快照<br/>同批用户 / 视频向量")]
+  Milvus[("Milvus 可选<br/>快照视频索引")]
   ObjectStorage[("对象存储<br/>媒体文件")]
 
   Web -->|"调用管理与浏览接口"| API
   Client -->|"调用公开 API"| API
-  API -->|"读写 account / video / video_stat"| MySQL
+  API -->|"读写业务数据和观看行为"| MySQL
   API -->|"保存和读取本地文件"| Uploads
-  API -.->|"缓存 Feed 与计数"| Redis
-  API -.->|"投递互动和审核事件"| MQ
+  API -->|"缓存 Feed 与计数"| Redis
+  API -->|"投递互动、发布和观看事件"| MQ
+  MQ -->|"消费互动和发布事件"| Worker
+  Worker -->|"落库 / fanout"| MySQL
+  Worker -->|"关注流索引与预热"| Redis
+  MySQL -.->|"只读导出视频与行为"| Trainer
+  Trainer -->|"全批训练并导出"| Snapshot
+  Snapshot -->|"API 启动时加载"| API
+  API -->|"完整导入本批索引后检索"| Milvus
   API -.->|"迁移媒体文件"| ObjectStorage
 
   class Web,Client client;
-  class API system;
-  class MySQL,Uploads store;
-  class Redis,MQ,ObjectStorage future;
+  class API,Worker,Trainer system;
+  class MySQL,Uploads,Redis,MQ,Snapshot,Milvus store;
+  class ObjectStorage future;
   linkStyle default stroke:#94A3B8,stroke-width:1.4px
 ```
 
@@ -79,15 +90,17 @@ flowchart LR
   Entry["cmd/feed/main.go<br/>启动装配"]
   Router["Router<br/>路由注册"]
   Auth["JWT Middleware<br/>鉴权上下文"]
-  Handlers["HTTP Handlers<br/>account / video / feed / upload"]
-  Services["Application Services<br/>account / video / feed"]
-  Domains["Domain Models<br/>account / video / feed"]
+  Handlers["HTTP Handlers<br/>account / video / feed / recommendation / exposure 等"]
+  Services["Application Services<br/>业务用例与推荐排序"]
+  Domains["Domain Models<br/>业务规则与接口"]
   Config["Config Loader<br/>configs/config.yaml"]
   JWT["JWT Manager<br/>签发访问令牌"]
   Repo["GORM Repository<br/>仓储实现"]
   SQL["database/sql<br/>MySQL 连接"]
   MySQL[("MySQL")]
   Uploads[("uploads 目录")]
+  Recaller["Two-tower Recaller<br/>快照检索"]
+  Model[("JSON 快照 / 可选 Milvus")]
 
   Entry -->|"加载配置"| Config
   Entry -->|"创建数据库连接"| SQL
@@ -98,6 +111,9 @@ flowchart LR
   Handlers -->|"调用用例服务"| Services
   Services -->|"执行领域规则"| Domains
   Services -->|"读写仓储"| Repo
+  Services -->|"检索双塔候选"| Recaller
+  Recaller -->|"读取同批用户与视频向量"| Model
+  Recaller -->|"校验视频与作者状态"| Repo
   Repo -->|"复用连接池"| SQL
   SQL -->|"持久化数据"| MySQL
   Handlers -->|"保存上传文件"| Uploads
@@ -107,14 +123,14 @@ flowchart LR
   class Router,Auth,Handlers http;
   class Services service;
   class Domains domain;
-  class Config,JWT,Repo,SQL infra;
-  class MySQL,Uploads store;
+  class Config,JWT,Repo,SQL,Recaller infra;
+  class MySQL,Uploads,Model store;
   linkStyle default stroke:#94A3B8,stroke-width:1.4px
 ```
 
 ## 3. 核心请求链路
 
-这张图展示从注册、登录、上传、发布到刷 Feed 的 MVP 主链路。
+这张图展示从注册、登录、上传、发布到最新流和热门流的主要链路。推荐流另见下方说明。
 
 ```mermaid
 ---
@@ -206,9 +222,17 @@ sequenceDiagram
   H-->>C: 返回 hot feed items
 ```
 
+### 推荐流与离线更新
+
+`RecommendStrategy.List` 需要登录，调用推荐服务和快照召回器；召回器使用快照中的个人向量或默认用户向量检索，再批量校验视频已发布且作者正常。推荐服务按相似度排序、去重和剔除近期曝光，分页后做同作者打散，Feed 最后复用卡片与计数的批量组装。
+
+Web 将有效观看和完播写入 `video_view_events`。新增行为、新用户历史和新视频在下次 CPU 训练、导出完整快照并重启 API 后生效；当前没有消费观看消息来实时修改双塔向量的 Worker。可选 Milvus 使用快照内容摘要隔离集合，完整导入该批视频向量后才接受查询。
+
+快照缺失时，推荐首屏走最新流，续页保留 `latest.` 游标和最新流排序。快照损坏、Milvus 未就绪或索引故障返回 503；有效模型没有候选时返回空列表。模型推荐游标绑定快照版本，升级后需刷新首屏。详细边界见[Feed 模块](modules/feed.md#6-recommend-读取与分页)。
+
 ## 4. 数据模型
 
-这张图展示当前 GORM 自动迁移的三张核心表及 Feed 查询依赖。
+这张图只展示内容查询依赖的三张核心表。实际自动迁移还覆盖会话、关系、互动、消息、播放、观看行为和曝光等表；完整列表以 `internal/infra/persistence/migration/migration.go` 为准。
 
 ```mermaid
 ---
@@ -255,7 +279,7 @@ erDiagram
 
 ## 5. 演进能力地图
 
-这张图展示已落地闭环和后续模块的连接方式，虚线代表规划中的能力边界。
+这张图展示已落地模块和规划模块的连接方式。审核、后台运营、完整治理仍属规划；Prometheus/Grafana 基础采集与看板已经接入，完整告警管理仍待补齐。
 
 ```mermaid
 ---
@@ -287,32 +311,34 @@ flowchart TB
   Message["消息"]
   Admin["后台运营"]
   Governance["系统治理"]
-  Observability["监控告警"]
-  AsyncStore[("Redis / MQ / 对象存储")]
+  Observability["监控基础 / 告警规划"]
+  AsyncStore[("Redis / MQ")]
+  ObjectStore[("对象存储规划")]
 
   Account -->|"扩展关注关系"| Interaction
   Video -->|"进入内容审核"| Review
   Video -->|"承载点赞评论收藏"| Interaction
-  Upload -->|"迁移媒体文件"| AsyncStore
-  Feed -->|"接入召回排序"| Recommendation
+  Upload -.->|"未来迁移媒体文件"| ObjectStore
+  Feed -->|"双塔检索与排序"| Recommendation
   Recommendation -->|"返回候选内容"| Feed
   Interaction -->|"投递互动事件"| AsyncStore
-  AsyncStore -->|"生成站内通知"| Message
+  Interaction -->|"生成站内通知"| Message
   Admin -->|"处理审核任务"| Review
   Governance -->|"保护核心接口"| Feed
   Observability -->|"采集服务指标"| Governance
 
-  class Account,Video,Feed,Upload current;
-  class Recommendation,Interaction,Review,Message,Admin growth;
+  class Account,Video,Feed,Upload,Recommendation,Interaction,Message current;
+  class Review,Admin growth;
   class Governance,Observability platform;
-  class AsyncStore data;
+  class AsyncStore current;
+  class ObjectStore data;
   linkStyle default stroke:#94A3B8,stroke-width:1.4px
 ```
 
 ## 6. 说明
 
-- 当前代码以 Go API 单体承载账户、视频、Feed 与上传能力，内部按接口层、应用层、领域层、基础设施层组织。
+- 当前代码以 Go API 单体承载用户端业务和推荐检索，内部按接口层、应用层、领域层、基础设施层组织；互动落库和视频 fanout 由独立 Worker 进程消费。
 - 对外接口统一挂载在 `/api/*`，静态文件通过 `/uploads/*` 访问，健康检查使用 `/health`。
-- 数据持久化使用 MySQL，GORM 自动迁移 `account`、`video`、`video_stat` 三张表。
-- Feed 通过 `scene` 分发策略：`timeline` 按 `published_at DESC, id DESC` 排序，`hot` 按最近 60 分钟互动热度排序，并通过 Base64 游标分页。
-- 推荐、互动、审核、消息、治理和监控模块作为演进边界保留，后续可从单体内模块逐步扩展为异步事件和独立服务。
+- MySQL 保存业务事实和观看行为，Redis 保存 Feed 缓存、短期行为状态和热榜；双塔服务读取本批训练快照，旧 `video_embedding` 表不是当前双塔向量来源。
+- Feed 通过 `scene` 分发 `timeline`、`hot`、`following`、`recommend` 四个策略，分别对应最新、热门、关注和双塔推荐。关注、热门频道保持独立。
+- 审核、后台运营和治理能力仍是演进边界；服务拆分方案见 [evolution.md](evolution.md)，不代表当前已经部署微服务。

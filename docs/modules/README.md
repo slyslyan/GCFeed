@@ -11,7 +11,7 @@
 | 内容 | 视频 | [video.md](video.md) | 已实现 |
 | 内容 | 互动 | [interaction.md](interaction.md) | 已实现 |
 | 分发 | Feed | [feed.md](feed.md) | 已实现 |
-| 分发 | 推荐 | [recommendation.md](recommendation.md) | 已实现 |
+| 分发 | 推荐 | [recommendation.md](recommendation.md) | 已实现 CPU 双塔训练与快照检索接入，真实效果待验证 |
 | 治理 | 审核 | [review.md](review.md) | 规划中 |
 | 治理 | 后台运营 | [admin.md](admin.md) | 规划中 |
 | 体验 | 消息 | [message.md](message.md) | 已实现 |
@@ -31,3 +31,5 @@
 6. 前端接入点。
 
 已实现模块应补齐业务规则和测试建议。规划中模块先定义最小闭环能力，后续通过 OpenSpec change 细化实现方案。
+
+推荐训练、真实样本导出和模型上线操作见 [CPU 双塔训练说明](../../tools/twotower/README.md)；服务行为与快照异常处理以[推荐模块](recommendation.md)为准。

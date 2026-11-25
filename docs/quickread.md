@@ -4,7 +4,7 @@
 
 ## 1. 先建立项目模型
 
-GCFeed 是一个短视频 Feed 系统。你可以把它理解成四条主线：
+GCFeed 是一个短视频 Feed 系统。你可以把它理解成五条主线：
 
 | 主线 | 负责什么 | 当前代码里的模块 |
 | --- | --- | --- |
@@ -12,8 +12,9 @@ GCFeed 是一个短视频 Feed 系统。你可以把它理解成四条主线：
 | 内容 | 发布视频、上传文件、视频详情 | `video`、`upload` |
 | 分发 | Timeline Feed、Hot Feed、分页、缓存 | `feed`、Redis |
 | 互动 | 点赞、收藏、评论、热度、异步落库 | `interaction`、Redis、RabbitMQ |
+| 推荐 | 观看反馈、CPU 训练、快照、单路向量召回 | `exposure`、`recommendation`、`infra/twotower`、Milvus |
 
-读代码时优先围绕这四条主线理解项目。每条主线都有独立的 domain、application、infra、http 代码，模块边界比较清晰。
+读代码时优先围绕这五条主线理解项目。每条主线都有独立的 domain、application、infra、http 代码，模块边界比较清晰。
 
 ## 2. 先看目录分层
 
@@ -218,6 +219,43 @@ routing key: interaction.action_changed
 - 接口立即返回 Redis 里的最新计数。
 - MySQL 通过 Worker 最终写入。
 
+### 4.6 CPU 双塔推荐链路
+
+推荐频道要求登录，入口仍是 Feed 接口：
+
+```text
+GET /api/feed-items?scene=recommend
+POST /api/video-view-events
+```
+
+先读离线训练，再读在线检索：
+
+1. `apps/web/src/App.jsx` 的 `sampleVideoViewState`：有效播放、页面可见性、媒体进度和完播采样。
+2. `interfaces/http/exposure/handler.go`、`application/exposure/service.go`：观看事件校验与持久化。
+3. `tools/twotower/export_videos.sql`、`export_events.sql`：训练目录与行为数据格式。
+4. `tools/twotower/train.py`：内容特征、过去历史池化、两个可训练投影、BPR、时间切分评估和全量导出。
+5. `infra/twotower/model.go`：加载同批次用户/视频向量，使用个人向量或默认用户向量，准备 Milvus 集合或本地精确检索。
+6. `application/recommendation/service.go`：相似度排序、去重、曝光过滤、版本游标与作者打散。
+7. `application/feed/service.go` 的 `RecommendStrategy`：把召回 ID 组装成 Feed 卡片，处理缺少模型文件时的最新流回退。
+
+完整链路：
+
+```text
+Web 有效观看 -> video_view_events
+  -> 离线导出 -> CPU 双塔训练与评估 -> 完整 JSON 快照
+  -> API 重启加载 -> 个人/默认用户向量 -> 单路向量召回
+  -> 发布状态与曝光过滤 -> 作者打散 -> Feed 卡片组装
+```
+
+关键点：
+
+- 训练样本的用户历史只包含目标之前的正反馈；留出集不参与参数训练或训练期用户画像生成。
+- 在线推荐只按模型余弦相似度排序，热榜和关注流是独立频道。
+- API 启动时固定一份快照，用户画像和新内容向量在下一次训练导出后更新。
+- Milvus 集合按完整文件摘要隔离，推荐游标绑定模型版本，避免不同向量空间混用。
+- 仅模型文件不存在时，推荐首屏回退最新流，后续分页通过 `latest.` 游标继续沿用该顺序；文件损坏或 Milvus 不可用时返回 503。
+- `milvus.address` 为空时，小型目录使用内存精确余弦检索。训练、配置和上线步骤见 `tools/twotower/README.md`。
+
 ## 5. 用测试理解代码
 
 `apps/api/test` 是很好的代码阅读入口。测试里用内存仓储搭出真实接口流程，可以快速理解每个模块的行为。
@@ -229,6 +267,8 @@ routing key: interaction.action_changed
 | `account_api_test.go` | 注册、登录、JWT |
 | `video_api_test.go` | 发布视频、幂等、软删除 |
 | `feed_api_test.go` | Timeline、Hot Feed、缓存、分页 |
+| `recommendation_api_test.go` | 推荐候选、曝光决策和曝光写入 |
+| `recommend_fallback_test.go` | 缺快照首屏回退、模型切换、个人/默认向量及空候选 |
 | `interaction_api_test.go` | 点赞、收藏、评论、异步落库 |
 | `relation_api_test.go` | 关注关系 |
 
@@ -252,6 +292,8 @@ go test ./...
 | 看 JWT | `apps/api/internal/infra/jwt` |
 | 看 Redis 缓存 | `apps/api/internal/infra/cache/feed_cache.go` |
 | 看 RabbitMQ | `apps/api/internal/infra/mq/rabbitmq.go` |
+| 看双塔训练 | `tools/twotower/train.py` |
+| 看模型快照和召回 | `apps/api/internal/infra/twotower/model.go` |
 | 看数据库模型 | `apps/api/internal/infra/persistence/*/model.go` |
 | 看 API 测试 | `apps/api/test/*_api_test.go` |
 
@@ -318,6 +360,8 @@ curl http://127.0.0.1:8080/health
 | `docs/engineering.md` | 新增代码前看工程规范 |
 | `docs/modules/feed.md` | 深入 Feed、分页、热榜 |
 | `docs/modules/interaction.md` | 深入点赞、收藏、评论、异步落库 |
+| `docs/modules/recommendation.md` | 深入单路双塔推荐、模型快照、曝光过滤与版本游标 |
+| `tools/twotower/README.md` | CPU 训练、留出评估、全量导出与快照上线 |
 | `docs/optimization.md` | 理解高并发优化路线 |
 
 ## 11. 当前最值得关注的下一步

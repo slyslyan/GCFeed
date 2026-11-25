@@ -2,16 +2,18 @@
 
 当前 GCFeed 是 DDD 四层单体（一个 Go 二进制服务所有 API 路由），通过 RabbitMQ 解耦异步事件。本文记录未来拆分为独立微服务时的架构设想，不作为近期开发计划。
 
+推荐现状是 Python 标准库在 CPU 上离线训练双塔，Go API 读取同一批导出的用户/视频向量，并在本机或可选 Milvus 检索。训练、导出和重启 API 才会更新向量；没有独立的 Python 在线推荐服务或实时画像 Worker。当前链路见[推荐模块](modules/recommendation.md)，操作见[训练说明](../tools/twotower/README.md)。
+
 ## 1. 拆分动机
 
 单体在 GCFeed 当前规模下完全够用。以下场景出现时才值得拆：
 
 | 触发条件 | 说明 |
 |---|---|
-| **推荐模型变重** | 推荐服务需要独立扩缩容（GPU/CPU 需求不同） |
+| **推荐任务争用资源** | CPU 训练、向量索引或 API 检索有可测的独立扩缩容需求 |
 | **Feed RT 要求与后台任务冲突** | 运营批量操作导致 DB 连接池被打满，影响用户 Feed 请求 |
 | **独立迭代速度需求** | 推荐团队和 Feed 团队需要独立的发布节奏 |
-| **技术栈分化** | 推荐模块采用 Python/ML 栈，与 Go 主服务不同 |
+| **技术栈分化** | 未来在线编码若需独立 Python/ML 服务，再评估跨语言部署；当前 Python 只用于离线训练 |
 
 ## 2. 服务边界划分
 
@@ -52,7 +54,7 @@
 | **Account Service** | `account` | 注册/登录/用户资料/关注关系 | 可直接暴露 JWT |
 | **Video Service** | `video`, `video_stat` | 视频 CRUD、媒体元数据 | 纯数据服务，无业务逻辑 |
 | **Feed Service** | 无（只读 video） | Feed 列表（timeline/hot/following） | 读缓存为主，数据从 Video Service 来 |
-| **Recommend Service** | `exposure`, `recommendation` | 召回、排序、曝光控制 | 可独立使用 Python/ML |
+| **Recommend Service** | `video_view_events`、`exposures` 及模型快照 | 召回、排序、曝光控制 | 规划中的独立服务；当前检索仍在 Go API，CPU 训练在进程外离线执行 |
 | **Interaction Service** | `interaction`, `comment` | 点赞/收藏/评论 | 事件驱动写入，RPC 读取 |
 | **Message Service** | `message` | 站内信通知 | 纯事件驱动 + 查询 |
 | **Playback Service** | `playback_config`, `qos_report` | 播放配置、QoS上报 | |
@@ -121,20 +123,27 @@ service InteractionService {
 }
 ```
 
-### 3.2 异步事件：RabbitMQ（保留不变）
+### 3.2 异步事件与离线模型更新
 
-现有的事件驱动路径保留，无需改为 gRPC：
+当前 Worker 的事件驱动路径可保留，无需改为 gRPC：
 
 ```
 Video Published ──► RabbitMQ ──► FanoutWorker (feed)
-                              ──► EmbeddingWorker (recommend)
 
 Action Changed ──► RabbitMQ ──► ActionWorker (interaction → DB 落库)
-
-View Event Recorded ──► RabbitMQ ──► (推荐画像更新)
 ```
 
 事件传递适合最终一致性场景：写入后可接受秒级延迟，不需要同步等待。
+
+观看接口持久化 `video_view_events`，并可发布 `ViewEventRecordedEvent`；当前没有消费该消息来更新双塔画像的 Worker。推荐走独立离线链路：
+
+```text
+video + video_view_events → 同一数据快照导出 → CPU 双塔训练 / 评估
+                         → 完整用户 / 默认用户 / 视频向量快照
+                         → 重启 API 加载 → 可选 Milvus 本批索引就绪 → 在线检索
+```
+
+原 hash-ngram EmbeddingWorker 已退出当前启动链路。未来若引入在线增量编码或画像事件消费，必须另行定义训练/服务编码器一致性、消息幂等和批次切换契约。
 
 ### 3.3 数据同步：CDC / 事件订阅
 
@@ -153,8 +162,10 @@ Video Service 创建视频
   │
   ├── gRPC 同步写入自身 DB
   └── RabbitMQ ── "VideoUpdated" ──► Feed Service 更新本地只读缓存
-                                    ──► Recommend Service 更新索引
+                                    ──► Recommend Service 更新索引（未来增量编码方案）
 ```
+
+该索引事件更新是拆分后的设想；当前新视频进入推荐目录仍依赖下次完整训练快照，不能把它描述成已实现的实时更新。
 
 ## 4. 调用链路对比
 
@@ -173,13 +184,13 @@ Feed 一次请求 = 1 次 TCP 连接（Client → API）
 
 ```
 Feed 一次请求 = 1 次 TCP 连接（Client → Feed Service）
-              + 1 次 gRPC（Feed → Recommend, <5ms）
-              + 1 次 gRPC（Feed → Video, <5ms）
-              + 1 次 gRPC（Feed → Interaction, <3ms）
+              + 1 次 gRPC（Feed → Recommend）
+              + 1 次 gRPC（Feed → Video）
+              + 1 次 gRPC（Feed → Interaction）
               + 本地 Redis 查询（Feed Service 自管缓存）
 ```
 
-网络调用次数从 0 次服务间 RPC 变为 3 次。为保证延迟不劣化：
+以上是调用次数示意，不是实测时延。网络调用次数从 0 次服务间 RPC 变为 3 次，需通过压测判断是否值得拆分，并评估：
 
 - **Feed Service 本地缓存**：video 卡片、互动状态的热数据缓存在 Feed Service 本地 Redis，减少穿透 RPC
 - **并行请求**：Video 和 Interaction 的查询可并行发起
@@ -233,7 +244,7 @@ API Gateway 统一对外暴露 HTTP，内部使用 gRPC
 
 | 方案 | 优点 | 缺点 | 适用阶段 |
 |---|---|---|---|
-| **继续单体** | 零运维成本，部署简单 | 无法独立扩缩容 | 当前（~万级 DAU） |
+| **继续单体** | 部署与治理成本较低 | 无法独立扩缩容 | 当前；容量以实际压测和资源数据判断 |
 | **单体 + 独立 Go module** | 代码主权清晰，编译部署不变 | 还是单体，治理麻烦 | 阶段一 |
 | **HTTP + JSON 拆分** | 调试方便（curl），迁移成本低 | 序列化效率低，无契约校验 | 阶段二 |
 | **gRPC 拆分** | 强契约，高性能，多语言 | 协议文件管理成本，调试复杂 | 阶段三以后 |

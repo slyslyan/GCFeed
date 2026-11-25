@@ -12,6 +12,8 @@
 | 消息队列 | RabbitMQ |
 | 鉴权 | JWT |
 | Web | React、Vite |
+| 推荐训练 | Python 3.9+ 标准库、CPU 双塔训练 |
+| 推荐检索 | Go 读取同批向量快照；可选 Milvus |
 | 规格驱动 | OpenSpec |
 
 ## 2. 后端分层
@@ -330,7 +332,24 @@ OpenSpec 校验命令：
 openspec validate --all --strict
 ```
 
-## 15. 文档同步
+推荐训练与观看反馈的行为测试从仓库根目录执行：
+
+```bash
+python3 -m unittest discover -s tools/twotower -p 'test_*.py' -v
+node --test apps/web/test/view-events.test.mjs
+```
+
+## 15. 推荐训练与模型发布
+
+训练入口是 [`tools/twotower/train.py`](../tools/twotower/train.py)，样本导出、时间切分、模型格式和上线命令见[训练说明](../tools/twotower/README.md)。训练使用 CPU，Go 请求链路直接检索离线导出的用户/视频向量；Python 不作为在线 RPC 服务。
+
+- 同次训练的用户向量、默认用户向量、视频向量一起导出和加载，不能混用不同批次。快照不包含在线编码器，新行为和新视频需要重新训练、导出并重启 API。
+- 先用时间留出集与训练期热门基线比较，再用 `--full-train` 生成部署快照。全量训练报告没有独立留出评估，不能当作新的效果证明。
+- `recommendation_model` 相对 API 工作目录读取。Milvus 启用时等待该批次完整索引就绪；目录较小时可留空 `milvus.address` 使用本机精确检索。
+- 模型文件缺失、文件损坏、有效模型空结果和检索不可用应分别验证；仅缺失快照时 Feed 首屏回退到最新流。推荐游标绑定模型版本，换版本后刷新首屏。
+- 真实用户样本和模型向量不提交到仓库。训练指标、演示结果和 HTTP 压测分别说明数据与环境，不能直接宣称线上提升。
+
+## 16. 文档同步
 
 改动以下内容时同步文档：
 
@@ -342,6 +361,7 @@ openspec validate --all --strict
 | 改核心链路 | `docs/architecture.md` |
 | 改前端页面 | `docs/uiux.md` |
 | 改性能策略 | `docs/optimization.md` |
+| 改推荐模型或训练契约 | `docs/modules/recommendation.md`、`tools/twotower/README.md`，以及引用旧现状的架构、产品和阅读文档 |
 
 新增后端能力检查清单：
 
