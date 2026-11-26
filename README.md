@@ -183,6 +183,7 @@ Prometheus 抓取目标：
 | [docs/engineering.md](docs/engineering.md) | 工程规范、目录规则、API 风格、测试约定 |
 | [docs/optimization.md](docs/optimization.md) | Feed 性能和稳定性专题 |
 | [docs/performance-testing.md](docs/performance-testing.md) | k6 压测、QPS/P95 解读、Grafana 指标观察 |
+| [从一次观看到百万视频召回](docs/two-tower-hnsw.md) | 用样例理解双塔、HNSW 建图，以及用户、视频或模型变化时该更新什么 |
 | [tools/twotower/README.md](tools/twotower/README.md) | CPU 双塔训练、留出评估、全量导出和模型上线 |
 | [docs/uiux.md](docs/uiux.md) | Web 客户端 UI/UX 规格 |
 | [docs/modules/](docs/modules/README.md) | 各业务模块设计 |
